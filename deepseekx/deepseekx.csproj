@@ -1,0 +1,43 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Indicate CPU runtime is intended -->
+    <TorchSharpCudaPackage>false</TorchSharpCudaPackage>
+    <TorchSharpCpuPackage>true</TorchSharpCpuPackage>
+    <!-- Ensure native libtorch native assets for Windows x64 are restored and copied to output -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <!-- Ensure Program.cs is compiled as part of the project (previously excluded) -->
+
+
+
+  <ItemGroup>
+    <PackageReference Include="ChessDotNet" Version="1.0.0" />
+    <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
+
+    <!-- Use CPU libtorch runtime (native) -->
+    <!-- TorchSharp managed bindings -->
+    <PackageReference Include="NumSharp" Version="0.30.0" />
+    <PackageReference Include="TorchSharp" Version="0.105.2" />
+    <PackageReference Include="TorchSharp-cpu" Version="0.105.2" />
+    <PackageReference Include="YahooFinanceApi" Version="2.3.3" />
+  </ItemGroup>
+
+
+
+
+
+
+
+
+
+</Project>
+
+  <!-- Ensure Program.cs is compiled as part of the project (previously excluded) -->

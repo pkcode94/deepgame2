@@ -1,0 +1,422 @@
+﻿// Program.cs
+// Corrected and cleaned single-file prototype of the Adversarial Fractal primitive.
+// Key fixes applied:
+//  - Removed premature disposal of tensors that participate in autograd.
+//  - Fixed sentence normalization (divide by sum of weights).
+//  - Safer manual anchor updates: compute gradient w.r.t. sentence vector and distribute to anchors by their weights.
+//  - Avoid excessive cloning; keep shapes and cosine_similarity dim explicit.
+//  - Clearer, smaller learning rate for manual anchor updates and stable HaltGate training.
+// Note: This is still a compact research prototype. For production, consider registering anchors as Parameters
+// and using an optimizer to update them directly.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using TorchSharp;
+using TorchSharp.Modules;
+using static TorchSharp.torch;
+using TSNN = TorchSharp.torch.nn;
+
+namespace AdversarialFractalGame
+{
+    public class LatentShiftOperator : TSNN.Module<Tensor, Tensor>
+    {
+        private readonly TSNN.Module<Tensor, Tensor> _shiftMap;
+        public LatentShiftOperator(long hDim, Device device) : base("ShiftOp")
+        {
+            _shiftMap = TSNN.Sequential(
+                TSNN.Linear(hDim, hDim, device: device),
+                TSNN.ReLU(),
+                TSNN.Linear(hDim, hDim, device: device)
+            );
+            RegisterComponents();
+        }
+        public override Tensor forward(Tensor x) => (x + _shiftMap.forward(x)) * 0.7071f;
+    }
+
+    // A single implicit "idle" gate layer (LSTM-like) that returns (h, c, urgency).
+    public class ImplicitIdleGateLayer : TSNN.Module<Tensor, Tensor, (Tensor h, Tensor c), (Tensor h, Tensor c, Tensor urgency)>
+    {
+        private readonly ParameterDict _params;
+        public ImplicitIdleGateLayer(long inputDim, long hDim, Device device) : base("IdleGate")
+        {
+            _params = new ParameterDict();
+            _params.Add("W", TSNN.Parameter(randn(new long[] { inputDim + hDim, 4 * hDim }, device: device) * 0.01f));
+            _params.Add("b", TSNN.Parameter(zeros(new long[] { 4 * hDim }, device: device)));
+            RegisterComponents();
+        }
+
+        // Note: do not Dispose tensors that are part of the autograd graph here.
+        public override (Tensor h, Tensor c, Tensor urgency) forward(Tensor x, Tensor hPrev, (Tensor h, Tensor c) state)
+        {
+            var combined = cat(new[] { x, hPrev }, dim: 1);
+            var weights = _params["W"];
+            var bias = _params["b"];
+            var allGates = (matmul(combined, weights) + bias).chunk(4, dim: 1);
+
+            var i = sigmoid(allGates[0]);
+            var f = sigmoid(allGates[1]);
+            var o = sigmoid(allGates[2]);
+            var g = tanh(allGates[3]);
+
+            Tensor cNext = (f * state.c) + (i * g);
+            Tensor hProposed = o * tanh(cNext);
+            Tensor hFinal = (hProposed + hPrev) * 0.5f;
+
+            // Return without disposing autograd tensors; runtime will free after backward.
+            return (hFinal, cNext, tensor(0.5f, device: combined.device));
+        }
+    }
+
+    // Fractal cell that applies latent shifts and repeated idle layers, with a HaltGate to stop recursion.
+    public class AdversarialFractalCell : TSNN.Module<Tensor, (Tensor[] h, Tensor[] c), (Tensor[] h, Tensor[] c, int depth, float confidence)>
+    {
+        private readonly int _maxDepth, _numLayers;
+        private readonly ImplicitIdleGateLayer[] _layers;
+        public readonly TSNN.Module<Tensor, Tensor> HaltGate;
+        private readonly LatentShiftOperator _shifter;
+
+        public AdversarialFractalCell(long inputDim, long hDim, int maxDepth, int numLayers, Device device) : base("FractalCell")
+        {
+            _maxDepth = maxDepth; _numLayers = numLayers;
+            _layers = new ImplicitIdleGateLayer[numLayers];
+            for (int i = 0; i < numLayers; i++) _layers[i] = new ImplicitIdleGateLayer(i == 0 ? inputDim : hDim, hDim, device);
+
+            HaltGate = TSNN.Sequential(
+                TSNN.Linear(hDim, hDim / 4, device: device),
+                TSNN.ReLU(),
+                TSNN.Linear(hDim / 4, 1, device: device),
+                TSNN.Sigmoid()
+            );
+
+            _shifter = new LatentShiftOperator(hDim, device);
+            RegisterComponents();
+        }
+
+        // Forward: returns arrays of h and c (one per layer), the depth used, and halt confidence.
+        public override (Tensor[] h, Tensor[] c, int depth, float confidence) forward(Tensor input, (Tensor[] h, Tensor[] c) state)
+        {
+            // Clone initial states to avoid mutating caller's tensors
+            var hCurr = state.h.Select(t => t.clone()).ToArray();
+            var cCurr = state.c.Select(t => t.clone()).ToArray();
+            int actualDepth = 0;
+            float finalConfidence = 0f;
+
+            for (int d = 0; d < _maxDepth; d++)
+            {
+                actualDepth = d + 1;
+                // Use a fresh copy of input for this depth
+                Tensor currentInput = input.clone();
+                var shiftedInput = _shifter.forward(currentInput);
+
+                for (int i = 0; i < _numLayers; i++)
+                {
+                    var (hN, cN, urg) = _layers[i].forward(shiftedInput, hCurr[i], (hCurr[i], cCurr[i]));
+                    var hFinal = (hN + shiftedInput) * 0.5f;
+
+                    // Dispose previous layer states (they were clones) to avoid leaks
+                    hCurr[i].Dispose();
+                    cCurr[i].Dispose();
+
+                    hCurr[i] = hFinal;
+                    cCurr[i] = cN;
+
+                    // prepare shiftedInput for next layer
+                    shiftedInput.Dispose();
+                    shiftedInput = hCurr[i].clone();
+                    currentInput.Dispose();
+                    currentInput = hCurr[i].clone();
+                }
+
+                // Evaluate halt confidence on the last layer's hidden state
+                var haltScore = HaltGate.forward(hCurr.Last());
+                finalConfidence = haltScore.item<float>();
+
+                // Clean up temporary tensors used in this depth iteration
+                // (we keep hCurr and cCurr for return)
+                haltScore.Dispose();
+
+                if (finalConfidence > 0.94f && d > 0)
+                {
+                    // break early if confident to halt
+                    break;
+                }
+            }
+
+            return (hCurr, cCurr, actualDepth, finalConfidence);
+        }
+    }
+    // --- NEW: Update a single word anchor safely ---
+
+    // ChatModel: manages anchors and uses the fractal core for prediction and a simple teach routine.
+    // ChatModel: manages anchors and uses the fractal core for prediction and a simple teach routine.
+    public class ChatModel
+    {
+        private readonly AdversarialFractalCell _fractalCore;
+        private readonly Dictionary<string, Tensor> _wordAnchors = new Dictionary<string, Tensor>();
+        private readonly Dictionary<string, Tensor> _sentenceAnchors = new Dictionary<string, Tensor>();
+        private readonly Device _device;
+        private readonly torch.optim.Optimizer _gateOptimizer;
+
+        public int HiddenDim { get; } = 256;
+
+        // Anchor learning rate (manual updates)
+        private readonly float _wordLr = 1e-2f;
+        private readonly float _sentenceLr = 5e-3f;
+
+        public ChatModel(Device device)
+        {
+            _device = device;
+            _fractalCore = new AdversarialFractalCell(HiddenDim, HiddenDim, 16, 2, device);
+            _gateOptimizer = torch.optim.Adam(_fractalCore.HaltGate.parameters(), lr: 1e-3);
+
+            // initialize eos anchor
+            GetWordAnchor("<eos>");
+        }
+
+        private string[] Tokenize(string text) =>
+            Regex.Replace(text.ToLower(), @"[^\w\s]", "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        private string CleanSentenceKey(string text) =>
+            Regex.Replace(text.ToLower(), @"[^\w\s]", "").Trim();
+
+        // ---------- WORD ANCHORS ----------
+
+        private Tensor GetWordAnchor(string word, bool requiresGrad = false)
+        {
+            string key = word.Trim().ToLower();
+            if (!_wordAnchors.ContainsKey(key))
+            {
+                _wordAnchors[key] = (randn(new long[] { 1, HiddenDim }, device: _device) * 0.1f).detach();
+            }
+
+            var anchor = _wordAnchors[key];
+            var clone = anchor.clone();
+            if (requiresGrad) clone.requires_grad = true;
+            return clone;
+        }
+
+        private void UpdateWordAnchor(string token, Tensor grad, float lr, float frac)
+        {
+            string key = token.Trim().ToLower();
+            if (!_wordAnchors.ContainsKey(key)) return;
+
+            var anchor = _wordAnchors[key];
+            var update = (anchor - lr * frac * grad).detach().clone();
+
+            _wordAnchors[key].Dispose();
+            _wordAnchors[key] = update;
+        }
+
+        // ---------- SENTENCE ANCHORS ----------
+
+        private Tensor GetSentenceAnchor(string sentenceKey, bool requiresGrad = false)
+        {
+            if (!_sentenceAnchors.ContainsKey(sentenceKey))
+            {
+                _sentenceAnchors[sentenceKey] = (randn(new long[] { 1, HiddenDim }, device: _device) * 0.1f).detach();
+            }
+
+            var anchor = _sentenceAnchors[sentenceKey];
+            var clone = anchor.clone();
+            if (requiresGrad) clone.requires_grad = true;
+            return clone;
+        }
+
+        private void UpdateSentenceAnchor(string sentenceKey, Tensor grad, float lr)
+        {
+            if (!_sentenceAnchors.ContainsKey(sentenceKey))
+            {
+                _sentenceAnchors[sentenceKey] = (randn(new long[] { 1, HiddenDim }, device: _device) * 0.1f).detach();
+            }
+
+            var anchor = _sentenceAnchors[sentenceKey];
+            var update = (anchor - lr * grad).detach().clone();
+
+            _sentenceAnchors[sentenceKey].Dispose();
+            _sentenceAnchors[sentenceKey] = update;
+        }
+
+        // ---------- COMPOSITION HELPERS ----------
+
+        // Old-style: build a weighted sentence vector from word anchors only.
+        private Tensor GetSentenceTensorFromWords(string sentence, bool requiresGrad = false)
+        {
+            var tokens = Tokenize(sentence);
+            if (tokens.Length == 0)
+                return zeros(new long[] { 1, HiddenDim }, device: _device);
+
+            Tensor weightedSum = null;
+            float sumWeights = 0f;
+
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                var t = GetWordAnchor(tokens[i], false);
+                float weight = (i == 0) ? 2.0f : 1.0f;
+                sumWeights += weight;
+
+                if (weightedSum is null)
+                    weightedSum = t * weight;
+                else
+                    weightedSum = weightedSum + (t * weight);
+
+                t.Dispose();
+            }
+
+            var result = weightedSum / sumWeights;
+
+            if (requiresGrad)
+            {
+                result.requires_grad = true;
+                result.retain_grad();
+            }
+
+            return result;
+        }
+
+        // ---------- TEACH ----------
+
+        // Teach: align input -> target by updating anchors manually and training HaltGate.
+        public string Teach(string input, string target, bool unlearn = false)
+        {
+            var inputTokens = Tokenize(input);
+            bool isIdentity = input.Trim().ToLower() == target.Trim().ToLower();
+            var cleanKey = CleanSentenceKey(input);
+
+            for (int epoch = 0; epoch < 40; epoch++)
+            {
+                // For teaching, we always build from WORD anchors (so gradients are meaningful)
+                using var subAnchor = GetSentenceTensorFromWords(input, true);
+                using var objAnchor = GetSentenceTensorFromWords(target, false);
+
+                // MSE loss between sentence vectors
+                using var loss = TSNN.functional.mse_loss(subAnchor, objAnchor);
+                loss.backward();
+
+                // Update HaltGate parameters with a small supervised signal
+                _gateOptimizer.zero_grad();
+                using var haltPrediction = _fractalCore.HaltGate.forward(subAnchor);
+                float targetHalt = isIdentity ? 1.0f : 0.95f;
+                using var haltTarget = tensor(new float[,] { { targetHalt } }, device: _device);
+                using var haltLoss = TSNN.functional.binary_cross_entropy(haltPrediction, haltTarget);
+                haltLoss.backward();
+                _gateOptimizer.step();
+
+                // Manual anchor updates
+                var gradSub = subAnchor.grad?.clone();
+                if (gradSub is not null)
+                {
+                    using (no_grad())
+                    {
+                        if (inputTokens.Length == 1)
+                        {
+                            // Single-word: update the word anchor directly
+                            UpdateWordAnchor(inputTokens[0], gradSub, _wordLr, 1.0f);
+                        }
+                        else
+                        {
+                            // Multi-word: DO NOT touch individual word anchors.
+                            // Only update the sentence-level anchor.
+                            UpdateSentenceAnchor(cleanKey, gradSub, _sentenceLr);
+                        }
+                    }
+
+                    gradSub.Dispose();
+                    subAnchor.grad?.zero_();
+                }
+            }
+
+            return $"SYNC: [{input}] -> [{target}] (Identity: {isIdentity})";
+        }
+
+        // ---------- PREDICT ----------
+
+        // Predict: single-step decode using sentence anchor if available, otherwise word-composed sentence vector.
+        public string Predict(string question)
+        {
+            var cleanKey = CleanSentenceKey(question);
+
+            Tensor inputVec;
+
+            if (_sentenceAnchors.ContainsKey(cleanKey))
+            {
+                // Use stored sentence-level memory directly
+                inputVec = _sentenceAnchors[cleanKey].clone();
+            }
+            else
+            {
+                // Fall back to word-composed sentence vector
+                inputVec = GetSentenceTensorFromWords(question);
+            }
+
+            using (inputVec)
+            {
+                var h = new Tensor[] { inputVec.clone(), inputVec.clone() };
+                var c = new Tensor[] {
+                zeros(new long[] { 1, HiddenDim }, device: _device),
+                zeros(new long[] { 1, HiddenDim }, device: _device)
+            };
+
+                var (hOut, cOut, depth, conf) = _fractalCore.forward(inputVec, (h, c));
+                using var currentThought = hOut.Last().clone();
+
+                string bestWord = "<eos>";
+                float maxSim = float.NegativeInfinity;
+
+                // Search only over WORD anchors for outputs
+                foreach (var entry in _wordAnchors)
+                {
+                    using var compareAnchor = entry.Value.clone();
+                    float sim = TSNN.functional.cosine_similarity(currentThought, compareAnchor, dim: 1).item<float>();
+                    if (sim > maxSim)
+                    {
+                        maxSim = sim;
+                        bestWord = entry.Key;
+                    }
+                }
+
+                foreach (var t in h) t.Dispose();
+                foreach (var t in c) t.Dispose();
+                foreach (var t in hOut) t.Dispose();
+                foreach (var t in cOut) t.Dispose();
+
+                return bestWord;
+            }
+        }
+
+
+        // Predict: run fractal core and pick best anchor words by cosine similarity with penalties.
+        // Predict: single-step decode using sentence memory if available, otherwise word-composed sentence vector.
+        
+    }
+
+    public class Program
+    {
+        public static void Main()
+        {
+            var chat = new ChatModel(torch.CPU);
+            Console.Clear();
+            Console.WriteLine("========================================");
+            Console.WriteLine(" ADVERSARIAL FRACTAL ENGINE v3.0.0 ");
+            Console.WriteLine(" [Context Isolation & Positional Weight] ");
+            Console.WriteLine("========================================");
+
+            while (true)
+            {
+                Console.Write("\nUser > ");
+                string line = Console.ReadLine() ?? "";
+                if (line.StartsWith("teach:"))
+                {
+                    var s = line.Substring(6).Split("=>");
+                    if (s.Length >= 2) Console.WriteLine(chat.Teach(s[0].Trim(), s[1].Trim(),true));
+                }
+                else if (line.StartsWith("ask:"))
+                {
+                    Console.WriteLine($"FractalGPT: {chat.Predict(line.Substring(4).Trim())}");
+                }
+            }
+        }
+    }
+}

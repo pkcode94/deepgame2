@@ -1,0 +1,2413 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Linq;
+using TorchSharp;
+using TorchSharp.Modules;
+using static TorchSharp.torch;
+using static TorchSharp.torch.nn;
+
+//
+// ===============================================================
+//  TOKEN-BASED SINE LSTM (STABLE VERSION + DEBUG PRINTS)
+//  - Single-band LSTM
+//  - Tokenized sine
+//  - Clean sine generator (full cycles)
+//  - Predicted vs Expected vs Input print
+//  - No randomized phase
+//  - No sampling (argmax only)
+//  - Fractal core disabled
+// ===============================================================
+//
+
+public partial class Program
+{
+    private const bool USE_SAMPLING = false;
+    private const bool USE_RANDOMIZED_PHASE = false;
+    private const bool USE_FRACTAL_CORE = true;
+    // holders for word tokenizer and embedding used by menu
+    private static WordTokenizer? _wordTokenizerHolder = null;
+    private static Module? _wordEmbeddingHolder = null;
+    // separate output layer for word vocabulary (hidden -> word vocab logits)
+    private static Module? _wordOutputHolder = null;
+
+    // in-memory example store for retrieval: contexts and response token ids
+    private static List<Tensor> _exampleContexts = new List<Tensor>();
+    private static List<int> _exampleResponses = new List<int>();
+    // (QA memory removed — learning via LSTM instead)
+
+    public static (Tensor, Tensor) GenerateSineBatch(int batchSize, int seqLen)
+    {
+        var x = torch.zeros(batchSize, seqLen, 1);
+        var y = torch.zeros(batchSize, seqLen, 1);
+
+        var rnd = new Random();
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            double phase = rnd.NextDouble() * Math.PI * 2;
+
+            for (int t = 0; t < seqLen; t++)
+            {
+                double v = Math.Sin(phase + t * 0.1);
+                x[b, t, 0] = (float)v;
+                y[b, t, 0] = (float)Math.Sin(phase + (t + 1) * 0.1);
+            }
+        }
+
+        return (x, y);
+
+    }
+
+    public static Tensor SliceTimeStep(Tensor x, int t)
+    {
+        // x shape: [batch, seqLen, features]
+        var scalar = x.index(new TensorIndex[] {
+        TensorIndex.Single(0),
+        TensorIndex.Single(t),
+        TensorIndex.Single(0)
+    });
+
+        // Return shape [1,1]
+        return scalar.unsqueeze(0).unsqueeze(1);
+    }
+
+    // Cosine similarity helper: returns scalar float in [-1,1]
+    public static float CosineSimilarity(Tensor a, Tensor b, float eps = 1e-8f)
+    {
+        // flatten inputs to 1-D
+        var af = a.flatten();
+        var bf = b.flatten();
+
+        var dot = (af * bf).sum();
+        var na = torch.sqrt((af * af).sum());
+        var nb = torch.sqrt((bf * bf).sum());
+
+        var denom = na * nb + torch.tensor(eps);
+        var sim = dot / denom;
+        return sim.ToSingle();
+    }
+
+    public static void TestPrediction(UnifiedMultiHeadTransformerLSTMCell cell)
+    {
+        int seqLen = 20;
+
+        // Generate a single sine sequence
+        var x = torch.zeros(1, seqLen, 1);
+        var y = torch.zeros(1, seqLen, 1);
+
+        double phase = 0.0;
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            double v = Math.Sin(phase + t * 0.1);
+            x[0, t, 0] = (float)v;
+            y[0, t, 0] = (float)Math.Sin(phase + (t + 1) * 0.1);
+        }
+
+        // Hidden state
+        var h = torch.zeros(1, cell.hiddenSize);
+        var c = torch.zeros(1, cell.hiddenSize);
+
+        Console.WriteLine("=== Forward‑Only Prediction Test ===");
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            // Slice x[:, t, :]
+            var xt = SliceTimeStep(x, t);
+
+            // Forward pass
+            (h, c) = cell.forward_step(xt, h, c);
+
+            // Extract prediction from h[:,0]
+            var predCol0 = h.index(new TensorIndex[] {
+            TensorIndex.Ellipsis,
+            TensorIndex.Single(0)
+        });
+
+            float inputVal = xt[0, 0].ToSingle();
+            float predVal = predCol0.ToSingle();
+            float targetVal = y[0, t, 0].ToSingle();
+
+            Console.WriteLine(
+                $"t={t:00} | input={inputVal,8:F4} | pred={predVal,8:F4} | target={targetVal,8:F4}"
+            );
+        }
+
+        Console.WriteLine("=== End Test ===");
+    }
+
+    public static Tensor GenerateLongSine(int totalSteps)
+    {
+        var x = torch.zeros(totalSteps, 1);
+
+        for (int t = 0; t < totalSteps; t++)
+            x[t, 0] = (float)Math.Sin(t * 0.05);
+
+        return x; // [T,1]
+    }
+
+    public static (Tensor, Tensor) MakeSlidingWindowBatch(
+    Tensor longSine, int start, int seqLen)
+    {
+        // Input window
+        var x = longSine.index(new TensorIndex[] {
+        TensorIndex.Slice(start, start + seqLen),
+        TensorIndex.Ellipsis
+    }).unsqueeze(0); // [1, seqLen, 1]
+
+        // Target is the next value
+        var scalar = longSine.index(new TensorIndex[] {
+            TensorIndex.Single(start + seqLen),
+            TensorIndex.Single(0)
+        }); // scalar tensor
+        var y = scalar.unsqueeze(0).unsqueeze(0); // [1,1]
+
+        return (x, y);
+    }
+
+    public static void TrainSlidingSine(
+        UnifiedMultiHeadTransformerLSTMCell cell,
+        Module embedding,
+        int seqLen = 50,
+        int epochs = 3,
+        int vocabSize = 100)
+    {
+        int totalSteps = 200;
+        var series = GenerateLongSine(totalSteps); // [T,1]
+
+        var tokenizer = new SineTokenizer(vocabSize);
+
+        // precompute token ids for entire series
+        var tokens = new int[totalSteps];
+        for (int i = 0; i < totalSteps; i++)
+        {
+            var scalar = series.index(new TensorIndex[] { TensorIndex.Single(i), TensorIndex.Single(0) });
+            tokens[i] = tokenizer.Encode(scalar.ToSingle());
+        }
+
+        // include embedding parameters in optimizer
+        var parameters = cell.parameters().Concat(((Module)embedding).parameters());
+        var opt = torch.optim.Adam(parameters, lr: 1e-4);
+
+        for (int epoch = 1; epoch <= epochs; epoch++)
+        {
+            Console.WriteLine($"=== Epoch {epoch} ===");
+
+            for (int start = 0; start < totalSteps - seqLen - 1; start++)
+            {
+                opt.zero_grad();
+
+                var h = torch.zeros(1, cell.hiddenSize);
+                var c = torch.zeros(1, cell.hiddenSize);
+
+                // Reset the internal attention memory for the cell so it does not
+                // accumulate states across different sliding-window samples.
+                cell.ResetMemory();
+
+                // feed seqLen steps: series[start + t]
+                Tensor loss = torch.tensor(0f);
+                for (int t = 0; t < seqLen; t++)
+                {
+                    // teacher forcing: feed token embedding of current step
+                    var inputId = tokens[start + t];
+                    var inputIdx = torch.tensor(new long[] { inputId });
+
+                    // embedding forward
+                    var emb = ((Module<Tensor, Tensor>)embedding).forward(inputIdx); // [1, embDim]
+
+                    (h, c) = cell.forward_step(emb, h, c);
+
+                    // output logits over vocab
+                    var logits = cell.output.forward(h); // [1, vocabSize]
+
+                    // target token id
+                    var targetId = tokens[start + t + 1];
+                    var targetTensor = torch.tensor(new long[] { targetId });
+
+                    loss += nn.functional.cross_entropy(logits, targetTensor);
+                }
+
+                // average loss over sequence length to keep scale consistent
+                loss = loss / seqLen;
+
+                loss.backward();
+
+                // clip gradients to prevent explosion
+                torch.nn.utils.clip_grad_norm_(cell.parameters(), 1.0);
+
+                opt.step();
+
+
+                Console.WriteLine($"start={start} loss={loss.ToSingle():F6}");
+            }
+        }
+    }
+
+
+    public static void PredictSliding(
+    UnifiedMultiHeadTransformerLSTMCell cell,
+    Module embedding,
+    int seqLen = 50)
+    {
+        var longSine = GenerateLongSine(2000);
+
+        // Take a window from the middle
+        int start = 500;
+
+        var (x, yTrue) = MakeSlidingWindowBatch(longSine, start, seqLen);
+
+        var h = torch.zeros(1, cell.hiddenSize);
+        var c = torch.zeros(1, cell.hiddenSize);
+
+        var tokenizer = new SineTokenizer(100);
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            // teacher-forced input: use token embedding for step t
+            // compute token ids for the longSine window
+            var inputId = tokenizer.Encode(x.select(1, t).squeeze().ToSingle());
+            var inputIdx = torch.tensor(new long[] { inputId });
+            var emb = ((Module<Tensor, Tensor>)embedding).forward(inputIdx);
+
+            (h, c) = cell.forward_step(emb, h, c);
+
+            var logits = cell.output.forward(h); // [1, vocab]
+            int predId = logits.argmax(1).ToInt32();
+            float pred = tokenizer.Decode(predId);
+
+            // actual next value after this timestep
+            var actualTensor = longSine.index(new TensorIndex[] {
+                TensorIndex.Single(start + t + 1),
+                TensorIndex.Single(0)
+            });
+            float actual = actualTensor.ToSingle();
+
+            // original scalar input value (before embedding)
+            float inputVal = x.select(1, t).squeeze().ToSingle();
+
+            Console.WriteLine($"t={start + t:000} | input={inputVal:F6} | pred={pred:F6} (id={predId}) | actual_next={actual:F6}");
+        }
+
+        var logitsFinal = cell.output.forward(h);
+        int predFinalId = logitsFinal.argmax(1).ToInt32();
+        float predFinal = tokenizer.Decode(predFinalId);
+        var actualFinalTensor = longSine.index(new TensorIndex[] {
+            TensorIndex.Single(start + seqLen),
+            TensorIndex.Single(0)
+        });
+        float actualFinal = actualFinalTensor.ToSingle();
+
+        Console.WriteLine($"Window end t={start + seqLen} | final_pred={predFinal:F6} (id={predFinalId}) | final_actual={actualFinal:F6}");
+    }
+
+    public static Tensor TrainStep(
+    UnifiedMultiHeadTransformerLSTMCell cell,
+    Tensor x, Tensor y,
+    torch.optim.Optimizer opt,
+    bool printDebug = false)
+    {
+        opt.zero_grad();
+
+        int batch = (int)x.shape[0];
+        int seq = (int)x.shape[1];
+
+        var h = torch.zeros(batch, cell.hiddenSize);
+        var c = torch.zeros(batch, cell.hiddenSize);
+
+        Tensor loss = torch.tensor(0f);
+
+        for (int t = 0; t < seq; t++)
+        {
+            Thread.Sleep(200);
+            // select time step t -> shape [batch, inputSize]
+            var xt = x.select(1, t);
+            var target = y.select(1, t);
+
+            // forward
+            (h, c) = cell.forward_step(xt, h, c);
+
+            // prediction from hidden state
+            var predCol0 = h.index(new TensorIndex[] {
+    TensorIndex.Ellipsis,
+    TensorIndex.Single(0)
+});
+
+            var predCol0_2D = predCol0.unsqueeze(1);
+
+            // accumulate loss
+            loss += torch.nn.functional.mse_loss(predCol0_2D, target);
+
+            if (printDebug)
+            {
+                // use squeeze to reduce to scalar safely before converting to single
+                float inputVal = xt.squeeze().ToSingle();
+                float predVal = predCol0.squeeze().ToSingle();
+                float targetVal = target.squeeze().ToSingle();
+
+                Console.WriteLine(
+                    $"t={t} | input={inputVal:F4} | pred={predVal:F4} | target={targetVal:F4}"
+                );
+            }
+        }
+
+        loss.backward();
+        opt.step();
+
+        return loss.detach();
+    }
+
+    // Simple webcrawler for testing
+
+    // Simple placeholder classifier — replace with neural network logic as needed.
+    private static bool ClassifyTokensSimple(string[] tokens)
+    {
+        if (tokens == null || tokens.Length == 0) return false;
+
+        // Simple heuristic: count tokens with length > 4 as signal
+        int score = 0;
+        foreach (var t in tokens)
+        {
+            if (t.Length > 4) score++;
+            // boost score for common 'relevant' cues (example)
+            var lw = t.ToLowerInvariant();
+            if (lw.Contains("news") || lw.Contains("research") || lw.Contains("report") || lw.Contains("study")) score += 3;
+            if (lw.Contains("buy") || lw.Contains("sale") || lw.Contains("discount")) score -= 2;
+        }
+
+        // threshold
+        return score >= Math.Max(10, tokens.Length / 10);
+    }
+
+
+    public static void CheckCudaAvailability()
+    {
+        try
+        {
+            bool cudaAvailable = torch.cuda.is_available();
+            Console.WriteLine($"CUDA available: {cudaAvailable}");
+
+            int deviceCount = 0;
+            try { deviceCount = torch.cuda.device_count(); } catch { /* not supported */ }
+            Console.WriteLine($"CUDA device count: {deviceCount}");
+
+            if (cudaAvailable && deviceCount > 0)
+            {
+                for (int i = 0; i < deviceCount; i++)
+                {
+                    try
+                    {
+                        Console.WriteLine($"-- Device {i} test --\"");
+                        // optional: set current device if API available
+                        // try { torch.cuda.set_device(i); } catch { }
+
+                        // allocate small tensor on CUDA and report device
+                        var t = torch.rand(new long[] { 2, 2 }).to(torch.CUDA);
+                        Console.WriteLine($"Allocated tensor device: {t.device}\"");
+                        // print current device index if available
+                        try
+                        {
+
+                            t.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Device {i} allocation failed: {ex.Message}\"");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Device {i} test failed: {ex.Message}");
+                    }
+
+                    {
+                        Console.WriteLine("No CUDA devices available or CUDA not supported by this build of TorchSharp.\"");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("CUDA check failed: {ex.Message}\"");
+        }
+    }
+
+    public static void Main(string[] args)
+    {
+        WebCrawler.InteractiveMenuAsync();
+        return;
+        // start a single continuous crawler in background (non-blocking)
+        try
+        {
+            Console.WriteLine("Starting background continuous webcrawler...");
+            //_ = Task.Run(() => WebCrawler.CrawlContinuouslyAsync("http://wikipedia.org", maxPages: 200, maxDepth: 2, extraSite: "https://gematrix.org", delayMs: 5_000));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Failed to start background crawler: " + ex.Message);
+        }
+
+        // interactive application continues immediately; no one-off blocking crawl
+
+        int vocabSize = 512;
+        int embeddingSize = 64;
+        var embedding = nn.Embedding(vocabSize, embeddingSize);
+
+        var cell = new UnifiedMultiHeadTransformerLSTMCell(
+           inputSize: embeddingSize,
+           hiddenSize: 64,
+           numHeads: 4,
+           outputSize: vocabSize
+       );
+        /*
+                        TrainSlidingSine(cell, embedding, seqLen: 50, epochs: 3);
+
+                        PredictSliding(cell, embedding, seqLen: 50);
+                */
+
+        // interactive menu
+        var tokenizer = new SineTokenizer(vocabSize);
+
+        while (true)
+        {
+            Console.WriteLine();
+            Console.WriteLine("=== Menu ===");
+            Console.WriteLine("1) predict (sliding window output)");
+            Console.WriteLine("2) tokenize (float -> token id)");
+            Console.WriteLine("3) detokenize (token id -> float)");
+            Console.WriteLine("4) chat/predict (enter floats, get next-token predictions)");
+            Console.WriteLine("5) exit");
+            Console.WriteLine("6) build word vocab from lines (interactive)");
+            Console.WriteLine("7) tokenize words (sentence -> tokens)");
+            Console.WriteLine("8) detokenize word token ids (ids -> sentence)");
+            Console.WriteLine("9) chat/predict words (tokens -> next word)");
+            Console.WriteLine("10) teach (enter question and response)");
+            Console.Write("Choose option: ");
+            var choice = Console.ReadLine();
+
+            if (choice == null) continue;
+
+            switch (choice.Trim())
+            {
+                case "1":
+                    PredictSliding(cell, embedding, seqLen: 50);
+                    break;
+                case "2":
+                    Console.Write("Enter float value [-1..1]: ");
+                    var s = Console.ReadLine();
+                    if (float.TryParse(s, out var f))
+                    {
+                        var id = tokenizer.Encode(f);
+                        var dec = tokenizer.Decode(id);
+                        Console.WriteLine($"token={id} decoded={dec:F6}");
+                    }
+                    else
+                        Console.WriteLine("Invalid float.");
+                    break;
+                case "3":
+                    Console.Write("Enter token id: ");
+                    var sid = Console.ReadLine();
+                    if (int.TryParse(sid, out var idv))
+                    {
+                        var decv = tokenizer.Decode(idv);
+                        Console.WriteLine($"decoded={decv:F6}");
+                    }
+                    else
+                        Console.WriteLine("Invalid token id.");
+                    break;
+                case "4":
+                    Console.WriteLine("Enter floats separated by space (e.g. 0.1 0.2 ...):");
+                    var line = Console.ReadLine();
+                    if (string.IsNullOrWhiteSpace(line)) break;
+
+                    var parts = line.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    var h = torch.zeros(1, cell.hiddenSize);
+                    var c = torch.zeros(1, cell.hiddenSize);
+
+                    foreach (var p in parts)
+                    {
+                        if (!float.TryParse(p, out var fv))
+                        {
+                            Console.WriteLine($"Could not parse '{p}', skipping.");
+                            continue;
+                        }
+
+                        var tid = tokenizer.Encode(fv);
+                        var inputIdx = torch.tensor(new long[] { tid });
+                        var emb = ((Module<Tensor, Tensor>)embedding).forward(inputIdx);
+
+                        (h, c) = cell.forward_step(emb, h, c);
+
+                        var logits = cell.output.forward(h);
+                        var predId = logits.argmax(1).ToInt32();
+                        var predVal = tokenizer.Decode(predId);
+
+                        Console.WriteLine($"input={fv:F6} -> pred_next={predVal:F6} (id={predId})");
+                    }
+                    break;
+                // ---------------- Word tokenizer / chat ----------------
+                case "6":
+                case "build_words":
+                    Console.WriteLine("Enter corpus lines (empty line to finish):");
+                    var lines = new List<string>();
+                    while (true)
+                    {
+                        var l = Console.ReadLine();
+                        if (string.IsNullOrWhiteSpace(l)) break;
+                        lines.Add(l);
+                    }
+                    if (lines.Count == 0)
+                    {
+                        Console.WriteLine("No lines provided.");
+                        break;
+                    }
+                    var wordTokenizer = new WordTokenizer();
+                    wordTokenizer.BuildVocabulary(lines, maxVocab: 10000);
+                    // ensure EOS token exists for generation
+                    var eosId = wordTokenizer.AddWord("<eos>");
+                    // create embedding for words
+                    var wordEmbedding = nn.Embedding(wordTokenizer.VocabSize, embeddingSize);
+                    // store in local variables by closing over via tuple (cheap):
+                    _wordTokenizerHolder = wordTokenizer;
+                    _wordEmbeddingHolder = wordEmbedding;
+                    // create output layer for word vocab
+                    _wordOutputHolder = nn.Linear(cell.hiddenSize, wordTokenizer.VocabSize);
+                    Console.WriteLine($"Built word vocab size={wordTokenizer.VocabSize} (EOS id={eosId})");
+                    break;
+                case "7":
+                case "tokenize_words":
+                    if (_wordTokenizerHolder == null)
+                    {
+                        Console.WriteLine("Word tokenizer not built yet. Use option 6 to build.");
+                        break;
+                    }
+                    Console.Write("Enter sentence to tokenize: ");
+                    var sent = Console.ReadLine();
+                    var toks = _wordTokenizerHolder.Tokenize(sent);
+                    Console.WriteLine("Tokens: " + string.Join(",", toks));
+                    Console.WriteLine("Detokenized: " + _wordTokenizerHolder.Detokenize(toks));
+                    break;
+                case "8":
+                case "detokenize_words":
+                    if (_wordTokenizerHolder == null)
+                    {
+                        Console.WriteLine("Word tokenizer not built yet. Use option 6 to build.");
+                        break;
+                    }
+                    Console.Write("Enter token ids separated by commas or spaces: ");
+                    var idLine = Console.ReadLine();
+                    if (string.IsNullOrWhiteSpace(idLine)) break;
+                    var idParts = idLine.Split(new[] { ',', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    var ids = new List<int>();
+                    foreach (var ip in idParts)
+                        if (int.TryParse(ip, out var ii)) ids.Add(ii);
+                    Console.WriteLine("Detokenized: " + _wordTokenizerHolder.Detokenize(ids));
+                    break;
+                case "9":
+                case "chat_words":
+                    int predIdW = -1;
+                    if (_wordTokenizerHolder == null || _wordEmbeddingHolder == null)
+                    {
+                        Console.WriteLine("Word tokenizer/embedding not ready. Build with option 6.");
+                        break;
+                    }
+                    Console.WriteLine("Enter words or sentence:");
+                    var ws = Console.ReadLine();
+                    if (string.IsNullOrWhiteSpace(ws)) break;
+
+                    var wparts = ws.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    var hh = torch.zeros(1, cell.hiddenSize);
+                    var cc = torch.zeros(1, cell.hiddenSize);
+
+                    // Feed all tokens as context first
+                    int eosIdLocal = _wordTokenizerHolder.Encode("<eos>");
+                    bool contextHasEos = false;
+                    foreach (var w in wparts)
+                    {
+                        var wid = _wordTokenizerHolder.Encode(w);
+                        if (wid == eosIdLocal)
+                        {
+                            contextHasEos = true;
+                            break; // stop feeding after EOS
+                        }
+
+                        var inputIdxW = torch.tensor(new long[] { wid });
+                        var embW = ((Module<Tensor, Tensor>)_wordEmbeddingHolder).forward(inputIdxW);
+                        (hh, cc) = cell.forward_step(embW, hh, cc);
+                    }
+
+                    if (contextHasEos)
+                    {
+                        Console.WriteLine("Input contains <eos>; skipping generation.");
+                    }
+                    else
+                    {
+                        // --- GENERATION: produce tokens until <eos> using cloned state ---
+                        int maxGen = 50;
+                        var genIds = new List<int>();
+                        var hhGen = hh.clone();
+                        var ccGen = cc.clone();
+
+                        // ensure placeholders for subsequent feedback logic
+                        predIdW = -1;
+
+                        for (int gi = 0; gi < maxGen; gi++)
+                        {
+                            var logitsGen = ((Module<Tensor, Tensor>)_wordOutputHolder).forward(hhGen); // [1,V]
+
+                            // compute probabilities and show top-k for debugging
+                            var probs = logitsGen.softmax(1);
+                            int debugTopK = Math.Min(20, (int)probs.shape[1]);
+                            var topRes = probs.topk(debugTopK, 1);
+                            var topVals = topRes.Item1; // [1,debugTopK]
+                            var topIdxs = topRes.Item2; // [1,debugTopK]
+
+                            Console.Write("Top candidates: ");
+                            for (int ti = 0; ti < Math.Min(5, debugTopK); ti++)
+                            {
+                                int tid = topIdxs[0, ti].ToInt32();
+                                float pv = topVals[0, ti].ToSingle();
+                                Console.Write($"'{_wordTokenizerHolder.Decode(tid)}'({tid}):{pv:F3} ");
+                            }
+                            Console.WriteLine();
+
+                            // explicit probs for tokens of interest
+                            int eosIdDbg = _wordTokenizerHolder.Encode("<eos>");
+                            int youIdDbg = _wordTokenizerHolder.Encode("you");
+                            float eosProb = 0f;
+                            float youProb = 0f;
+                            try
+                            {
+                                eosProb = probs[0, eosIdDbg].ToSingle();
+                                youProb = probs[0, youIdDbg].ToSingle();
+                            }
+                            catch { }
+                            Console.WriteLine($"Debug probs -> '<eos>'({eosIdDbg})={eosProb:F6}, 'you'({youIdDbg})={youProb:F6}");
+
+                            // keep greedy decoding (argmax) for now
+                            int gid = logitsGen.argmax(1).ToInt32();
+                            var gw = _wordTokenizerHolder.Decode(gid);
+                            if (gw == "<eos>")
+                            {
+                                Console.WriteLine("<EOS> reached. Generation finished.");
+                                break;
+                            }
+
+                            genIds.Add(gid);
+                            Console.WriteLine($"gen[{gi}] -> '{gw}' (id={gid})");
+
+                            // feed generated token embedding into cloned state
+                            var idxG = torch.tensor(new long[] { gid });
+                            var embG = ((Module<Tensor, Tensor>)_wordEmbeddingHolder).forward(idxG);
+                            (hhGen, ccGen) = cell.forward_step(embG, hhGen, ccGen);
+                        }
+                    }
+
+                    // continue with original single-step prediction (first-next) for compatibility with feedback flow
+                    // Ask user how many next words to predict and generate that many tokens greedily
+                    try
+                    {
+                        Console.Write("Enter number of words to predict (n, empty=1): ");
+                        var nLine = Console.ReadLine();
+                        int nPred = 1;
+                        if (!string.IsNullOrWhiteSpace(nLine) && !int.TryParse(nLine.Trim(), out nPred))
+                            nPred = 1;
+
+                        var hhGenFinal = hh.clone();
+                        var ccGenFinal = cc.clone();
+                        var genIdsFinal = new List<int>();
+
+                        for (int gi = 0; gi < Math.Max(0, nPred); gi++)
+                        {
+                            var logitsGen = ((Module<Tensor, Tensor>)_wordOutputHolder).forward(hhGenFinal);
+                            int gid = logitsGen.argmax(1).ToInt32();
+                            var gw = _wordTokenizerHolder.Decode(gid);
+                            if (gw == "<eos>")
+                            {
+                                Console.WriteLine("<EOS> reached during multi-step generation.");
+                                break;
+                            }
+
+                            genIdsFinal.Add(gid);
+
+                            var idxG = torch.tensor(new long[] { gid });
+                            var embG = ((Module<Tensor, Tensor>)_wordEmbeddingHolder).forward(idxG);
+                            (hhGenFinal, ccGenFinal) = cell.forward_step(embG, hhGenFinal, ccGenFinal);
+                        }
+
+                        if (genIdsFinal.Count > 0)
+                        {
+                            var genWords = genIdsFinal.Select(id => _wordTokenizerHolder.Decode(id));
+                            Console.WriteLine("Predicted sequence: " + string.Join(' ', genWords));
+                        }
+                        else
+                        {
+                            Console.WriteLine("No tokens generated.");
+                        }
+                    }
+                    catch
+                    {
+                        // fallback to single-step prediction on error
+                        try
+                        {
+                            var logitsW = ((Module<Tensor, Tensor>)_wordOutputHolder).forward(hh);
+                            predIdW = logitsW.argmax(1).ToInt32();
+                            string predWord = _wordTokenizerHolder.Decode(predIdW);
+                            Console.WriteLine($"Predicted next after input: '{predWord}' (id={predIdW})");
+                        }
+                        catch { }
+                    }
+                    break;
+                case "10":
+                case "teach":
+                    if (_wordTokenizerHolder == null || _wordEmbeddingHolder == null)
+                    {
+                        Console.WriteLine("Word tokenizer/embedding not ready. Build with option 6.");
+                        break;
+                    }
+                    Console.WriteLine("Enter question (sentence):");
+                    var qText = Console.ReadLine();
+                    if (string.IsNullOrWhiteSpace(qText)) break;
+                    Console.WriteLine("Enter response sentence:");
+                    var rText = Console.ReadLine();
+                    if (string.IsNullOrWhiteSpace(rText)) break;
+
+                    var qTokens = _wordTokenizerHolder.Tokenize(qText);
+                    var rTokens = _wordTokenizerHolder.Tokenize(rText);
+
+                    if (rTokens.Length == 0)
+                    {
+                        Console.WriteLine("Response must contain at least one token.");
+                        break;
+                    }
+
+                    // optimizer over cell + word embedding + word output
+                    var paramList = cell.parameters()
+                        .Concat(((Module)_wordEmbeddingHolder).parameters())
+                        .Concat(((Module)_wordOutputHolder).parameters());
+
+                    // perform multiple training iterations on this single example
+                    var optTeach = torch.optim.Adam(paramList, lr: 1e-3);
+
+                    int trainIters = 200; // increase to allow the model to learn the mapping
+                    Tensor lastLoss = torch.tensor(0f);
+
+                    for (int it = 1; it <= trainIters; it++)
+                    {
+                        optTeach.zero_grad();
+
+                        // initial hidden state
+                        var hTeach = torch.zeros(1, cell.hiddenSize);
+                        var cTeach = torch.zeros(1, cell.hiddenSize);
+
+                        cell.ResetMemory();
+
+                        // feed question tokens to set context
+                        foreach (var qt in qTokens)
+                        {
+                            var idx = torch.tensor(new long[] { qt });
+                            var embq = ((Module<Tensor, Tensor>)_wordEmbeddingHolder).forward(idx);
+                            (hTeach, cTeach) = cell.forward_step(embq, hTeach, cTeach);
+                        }
+
+                        // accumulate loss predicting response sequence
+                        Tensor lossTeach = torch.tensor(0f);
+
+                        // predict first response token from question context
+                        var logits0 = ((Module<Tensor, Tensor>)_wordOutputHolder).forward(hTeach);
+                        var target0 = torch.tensor(new long[] { rTokens[0] });
+                        lossTeach += nn.functional.cross_entropy(logits0, target0);
+
+                        // for remaining response tokens, teacher-force previous token
+                        for (int i = 1; i < rTokens.Length; i++)
+                        {
+                            var prev = rTokens[i - 1];
+                            var idxPrev = torch.tensor(new long[] { prev });
+                            var embPrev = ((Module<Tensor, Tensor>)_wordEmbeddingHolder).forward(idxPrev);
+                            (hTeach, cTeach) = cell.forward_step(embPrev, hTeach, cTeach);
+
+                            var logits = ((Module<Tensor, Tensor>)_wordOutputHolder).forward(hTeach);
+                            var target = torch.tensor(new long[] { rTokens[i] });
+                            lossTeach += nn.functional.cross_entropy(logits, target);
+                        }
+
+                        lossTeach = lossTeach / rTokens.Length;
+
+                        lossTeach.backward();
+
+                        // clip grads
+                        torch.nn.utils.clip_grad_norm_(paramList, 1.0);
+
+                        optTeach.step();
+
+                        lastLoss = lossTeach.detach();
+
+                        if (it % 50 == 0 || it == 1)
+                        {
+                            Console.WriteLine($"Teach iter={it} loss={lastLoss.ToSingle():F6}");
+                        }
+                    }
+
+                    // After training, show one prediction using the question context
+                    var hEval = torch.zeros(1, cell.hiddenSize);
+                    var cEval = torch.zeros(1, cell.hiddenSize);
+                    cell.ResetMemory();
+                    foreach (var qt in qTokens)
+                    {
+                        var idx = torch.tensor(new long[] { qt });
+                        var embq = ((Module<Tensor, Tensor>)_wordEmbeddingHolder).forward(idx);
+                        (hEval, cEval) = cell.forward_step(embq, hEval, cEval);
+                    }
+
+                    var logitsFinal = ((Module<Tensor, Tensor>)_wordOutputHolder).forward(hEval);
+                    var predIdFinal = logitsFinal.argmax(1).ToInt32();
+                    var predWordFinal = _wordTokenizerHolder.Decode(predIdFinal);
+
+                    Console.WriteLine($"Trained on example. Final loss={lastLoss.ToSingle():F6} -> Predicted next='{predWordFinal}' (id={predIdFinal})");
+
+                    // store example context + first response token for retrieval
+                    // normalize context and store on CPU to make retrieval stable
+                    var hCpu = hEval.detach().to(torch.CPU);
+                    var hNorm = hCpu / (torch.sqrt((hCpu * hCpu).sum()) + 1e-8);
+                    _exampleContexts.Add(hNorm);
+                    _exampleResponses.Add(rTokens[0]);
+                    Console.WriteLine($"Saved example for retrieval (response id={rTokens[0]})");
+                    break;
+                case "5":
+                case "exit":
+                    Console.WriteLine("Exiting.");
+                    goto MENU_END;
+                default:
+                    Console.WriteLine("Unknown option.");
+                    break;
+            }
+        }
+    MENU_END:;
+
+        return;
+        
+    }
+
+
+    public class TransformerLSTMCell : nn.Module
+    {
+        private readonly LSTMCell lstm;
+
+        private readonly Linear Wq;
+        private readonly Linear Wk;
+        private readonly Linear Wv;
+        private readonly Linear proj;
+        private readonly LayerNorm norm1;
+        private readonly LayerNorm norm2;
+        private readonly Linear ff1;
+        private readonly Linear ff2;
+
+        public readonly int hiddenSize;
+        private readonly List<Tensor> memory = new List<Tensor>();
+
+        public TransformerLSTMCell(int inputSize, int hiddenSize)
+            : base("transformer_lstm_cell")
+        {
+            this.hiddenSize = hiddenSize;
+
+            lstm = nn.LSTMCell(inputSize, hiddenSize);
+
+            Wq = nn.Linear(hiddenSize, hiddenSize);
+            Wk = nn.Linear(hiddenSize, hiddenSize);
+            Wv = nn.Linear(hiddenSize, hiddenSize);
+            proj = nn.Linear(hiddenSize, hiddenSize);
+
+            norm1 = nn.LayerNorm(new long[] { hiddenSize });
+            norm2 = nn.LayerNorm(new long[] { hiddenSize });
+
+            ff1 = nn.Linear(hiddenSize, hiddenSize * 4);
+            ff2 = nn.Linear(hiddenSize * 4, hiddenSize);
+
+            RegisterComponents();
+        }
+
+        public (Tensor h, Tensor c) forward(Tensor x, Tensor h, Tensor c)
+        {
+            // 1. LSTM step
+            (h, c) = lstm.forward(x, (h, c));
+
+            // 2. Append to memory (no grad through memory)
+            memory.Add(h.detach());
+
+            // 3. Self‑attention over memory
+            var M = torch.stack(memory.ToArray(), 0).squeeze(1); // [T,H]
+
+            var Q = Wq.forward(M); // [T,H]
+            var K = Wk.forward(M); // [T,H]
+            var V = Wv.forward(M); // [T,H]
+
+            var scores = torch.matmul(Q, K.transpose(0, 1)) / System.Math.Sqrt(hiddenSize); // [T,T]
+            var weights = scores.softmax(1).detach(); // [T,T]
+
+            var attn = torch.matmul(weights, V); // [T,H]
+
+            // 4. Take last token as current context
+            var lastIdx = attn.shape[0] - 1;
+            var ctx = attn.select(0, lastIdx).unsqueeze(0); // [1,H]
+
+            // 5. Residual + norm
+            var hAttn = norm1.forward(h + proj.forward(ctx));
+
+            // 6. Feed‑forward block
+            var ff = ff2.forward(ff1.forward(hAttn).relu());
+            var hFinal = norm2.forward(hAttn + ff);
+
+            return (hFinal, c);
+        }
+
+        public void ResetMemory()
+        {
+            memory.Clear();
+        }
+    }
+    public class MultiHeadAttentiveLSTMCell : nn.Module
+    {
+        private readonly LSTMCell lstm;
+
+        public readonly int hiddenSize;
+        private readonly int numHeads;
+        private readonly int headDim;
+
+        private readonly Linear Wq;
+        private readonly Linear Wk;
+        private readonly Linear Wv;
+        private readonly Linear fuse;
+
+        private readonly List<Tensor> memory = new List<Tensor>();
+
+        public MultiHeadAttentiveLSTMCell(int inputSize, int hiddenSize, int numHeads)
+            : base("multihead_attentive_lstm_cell")
+        {
+            this.hiddenSize = hiddenSize;
+            this.numHeads = numHeads;
+            this.headDim = hiddenSize / numHeads;
+
+            lstm = nn.LSTMCell(inputSize, hiddenSize);
+
+            Wq = nn.Linear(hiddenSize, hiddenSize);
+            Wk = nn.Linear(hiddenSize, hiddenSize);
+            Wv = nn.Linear(hiddenSize, hiddenSize);
+
+            fuse = nn.Linear(hiddenSize * 2, hiddenSize);
+
+            RegisterComponents();
+        }
+
+        public (Tensor h, Tensor c) forward(Tensor x, Tensor h, Tensor c)
+        {
+            // 1. Standard LSTM update
+            (h, c) = lstm.forward(x, (h, c));
+
+            // 2. Add hidden state to memory (no grad through memory)
+            memory.Add(h.detach());
+
+            if (memory.Count == 0)
+                return (h, c);
+
+            // 3. Stack memory: [T, H]
+            var M = torch.stack(memory.ToArray(), 0).squeeze(1); // [T,H]
+
+            // 4. Project to Q,K,V: [T,H]
+            var Q = Wq.forward(h);   // [1,H]
+            var K = Wk.forward(M);   // [T,H]
+            var V = Wv.forward(M);   // [T,H]
+
+            // 5. Reshape to multi‑head: [T, numHeads, headDim], [1,numHeads,headDim]
+            var Kmh = K.view(M.shape[0], numHeads, headDim); // [T,Hh,D]
+            var Vmh = V.view(M.shape[0], numHeads, headDim); // [T,Hh,D]
+            var Qmh = Q.view(1, numHeads, headDim);          // [1,Hh,D]
+
+            // 6. Compute attention per head
+            // scores: [Hh, T]
+            var scores = torch.einsum("thd,bhd->hb t", Kmh, Qmh); // but TorchSharp lacks einsum, so we do manual
+
+            // Manual: reshape to [Hh, T, D]
+            var Kperm = Kmh.permute(1, 0, 2); // [Hh,T,D]
+            var Qperm = Qmh.permute(1, 0, 2); // [Hh,1,D]
+
+            var attnOutputs = new List<Tensor>();
+
+            for (int head = 0; head < numHeads; head++)
+            {
+                var K_h = Kperm.index(torch.TensorIndex.Single(head)); // [T,D]
+                var Q_h = Qperm.index(torch.TensorIndex.Single(head)); // [1,D]
+
+                var scores_h = torch.matmul(K_h, Q_h.transpose(0, 1)); // [T,1]
+                var weights_h = scores_h.softmax(0).detach();          // [T,1]
+
+                // select V for this head: [:, head, :]
+                var V_h = Vmh.index(torch.TensorIndex.Colon, torch.TensorIndex.Single(head), torch.TensorIndex.Colon); // [T,D]
+                var ctx_h = (weights_h * V_h).sum(new long[] { 0 }).unsqueeze(0); // [1,D]
+                attnOutputs.Add(ctx_h);
+            }
+
+            // 7. Concatenate heads: [1, H]
+            var context = torch.cat(attnOutputs.ToArray(), 1); // [1,H]
+
+            // 8. Fuse LSTM output + context
+            var combined = torch.cat(new Tensor[] { h, context }, 1); // [1,2H]
+            var hFinal = fuse.forward(combined).tanh();               // [1,H]
+
+            return (hFinal, c);
+        }
+
+        public void ResetMemory()
+        {
+            memory.Clear();
+        }
+    }
+    public class AttentiveLSTM : nn.Module
+    {
+        private readonly AttentiveLSTMCell cell;
+        private readonly int hiddenSize;
+
+        public AttentiveLSTM(int inputSize, int hiddenSize)
+            : base("attentive_lstm")
+        {
+            this.hiddenSize = hiddenSize;
+            cell = new AttentiveLSTMCell(inputSize, hiddenSize);
+            RegisterComponents();
+        }
+
+        public (Tensor h, Tensor c, Tensor[] outputs) forward(Tensor x)
+        {
+            // x: [T, B, inputSize]
+            int T = (int)x.shape[0];
+            int B = (int)x.shape[1];
+
+            var h = torch.zeros(B, hiddenSize);
+            var c = torch.zeros(B, hiddenSize);
+
+            var outputs = new Tensor[T];
+
+            cell.ResetMemory();
+
+            for (int t = 0; t < T; t++)
+            {
+                var x_t = x[t]; // [B,inputSize]
+                (h, c) = cell.forward(x_t, h, c);
+                outputs[t] = h;
+            }
+
+            return (h, c, outputs);
+        }
+    }
+
+    public class BoardEncoder : nn.Module
+    {
+        private readonly Embedding embed;
+        private readonly Linear compress;
+        private readonly int hiddenSize;
+
+        public BoardEncoder(int hiddenSize)
+            : base("board_encoder")
+        {
+            this.hiddenSize = hiddenSize;
+
+            // 3 possible cell states: empty, X, O
+            embed = nn.Embedding(3, hiddenSize);
+
+            // compress 9*H → H
+            compress = nn.Linear(9 * hiddenSize, hiddenSize);
+
+            RegisterComponents();
+        }
+
+        public Tensor forward(Cell[] board)
+        {
+            // convert board to tensor of indices
+            long[] idx = new long[9];
+            for (int i = 0; i < 9; i++)
+                idx[i] = (long)board[i];
+
+            // [1,9]
+            var t = torch.tensor(idx, dtype: ScalarType.Int64).unsqueeze(0);
+
+            // [1,9,H]
+            var e = embed.forward(t);
+
+            // [1,9H]
+            var flat = e.flatten(1);
+
+            // [1,H]
+            return compress.forward(flat).tanh();
+        }
+    }
+
+
+    public class AttentiveLSTMCell : nn.Module
+    {
+        private readonly LSTMCell lstm;
+        private readonly Linear Wq;
+        private readonly Linear Wk;
+        private readonly Linear Wv;
+        private readonly Linear fuse;
+
+        private readonly List<Tensor> memory = new List<Tensor>();
+        private readonly int hiddenSize;
+
+        public AttentiveLSTMCell(int inputSize, int hiddenSize)
+            : base("attentive_lstm_cell")
+        {
+            this.hiddenSize = hiddenSize;
+
+            lstm = nn.LSTMCell(inputSize, hiddenSize);
+
+            Wq = nn.Linear(hiddenSize, hiddenSize);
+            Wk = nn.Linear(hiddenSize, hiddenSize);
+            Wv = nn.Linear(hiddenSize, hiddenSize);
+
+            fuse = nn.Linear(hiddenSize * 2, hiddenSize);
+
+            RegisterComponents();
+        }
+
+        public (Tensor h, Tensor c) forward(Tensor x, Tensor h, Tensor c)
+        {
+            // 1. Standard LSTM update
+            (h, c) = lstm.forward(x, (h, c));
+
+            // 2. Add hidden state to memory
+            memory.Add(h.detach());
+
+            // 3. Compute attention over memory
+            var q = Wq.forward(h); // [1,H]
+
+            var keys = new List<Tensor>();
+            var values = new List<Tensor>();
+
+            foreach (var m in memory)
+            {
+                keys.Add(Wk.forward(m));
+                values.Add(Wv.forward(m));
+            }
+
+            var K = torch.stack(keys.ToArray(), 0).squeeze(1);   // [T,H]
+            var V = torch.stack(values.ToArray(), 0).squeeze(1); // [T,H]
+
+            var attnScores = torch.matmul(K, q.transpose(0, 1)); // [T,1]
+            var attnWeights = attnScores.softmax(0);             // [T,1]
+
+            var context = (attnWeights * V).sum(new long[] { 0 }).unsqueeze(0); // [1,H]
+
+            // 4. Fuse LSTM output with attention context
+            var combined = torch.cat(new Tensor[] { h, context }, 1); // [1,2H]
+            var hFinal = fuse.forward(combined).tanh();               // [1,H]
+
+            return (hFinal, c);
+        }
+
+        public void ResetMemory()
+        {
+            memory.Clear();
+        }
+    }
+
+    // ------------------------------------------------------------
+    // TOKENIZER
+    // ------------------------------------------------------------
+    public class SineTokenizer
+    {
+        private readonly int vocabSize;
+
+        public SineTokenizer(int vocabSize = 500)
+        {
+            this.vocabSize = vocabSize;
+        }
+
+        public int Encode(float value)
+        {
+            float normalized = (value + 1f) / 2f;
+            int token = (int)(normalized * (vocabSize - 1));
+            return Math.Clamp(token, 0, vocabSize - 1);
+        }
+
+        public float Decode(int token)
+        {
+            float normalized = token / (float)(vocabSize - 1);
+            return normalized * 2f - 1f;
+        }
+    }
+    public class TransformBasis : nn.Module
+    {
+        public readonly Module[] F;
+
+        public TransformBasis(int size, int count) : base("transform_basis")
+        {
+            F = new Module[count];
+
+            for (int i = 0; i < count; i++)
+                F[i] = nn.Linear(size, size);
+
+            RegisterComponents();
+        }
+
+        public Tensor Apply(int index, Tensor x)
+        {
+            int safe = index % F.Length;
+            // Korrigiert: expliziter Cast zu Module<Tensor, Tensor> für forward-Aufruf
+            return ((Module<Tensor, Tensor>)F[safe]).forward(x);
+        }
+    }
+    public class CombinatorialPathGate : nn.Module
+    {
+        private readonly int hiddenSize;
+        private readonly int basisCount;
+
+        private readonly Module<Tensor, Tensor>[] basisTransforms;
+        private readonly Module<Tensor, Tensor> gateMLP;
+
+        public CombinatorialPathGate(int hiddenSize, int basisCount, int depth)
+            : base("combinatorial_path_gate")
+        {
+            this.hiddenSize = hiddenSize;
+            this.basisCount = basisCount;
+
+            basisTransforms = new Module<Tensor, Tensor>[basisCount];
+
+            for (int i = 0; i < basisCount; i++)
+            {
+                basisTransforms[i] = nn.Sequential(
+                    nn.Linear(hiddenSize, hiddenSize),
+                    nn.ReLU(),
+                    nn.Linear(hiddenSize, hiddenSize)
+                );
+            }
+
+            gateMLP = nn.Sequential(
+                nn.Linear(hiddenSize, hiddenSize),
+                nn.ReLU(),
+                nn.Linear(hiddenSize, basisCount)
+            );
+
+            RegisterComponents();
+        }
+
+        public Tensor forward(Tensor x)
+        {
+            var outputs = new Tensor[basisCount];
+
+            for (int i = 0; i < basisCount; i++)
+                outputs[i] = basisTransforms[i].forward(x);
+
+            var scores = gateMLP.forward(x); // [1, basisCount]
+            var weights = scores.softmax(1);
+
+            Tensor result = torch.zeros_like(x);
+
+            for (int i = 0; i < basisCount; i++)
+                result += weights[0, i] * outputs[i];
+
+            return result;
+        }
+    }
+
+    public enum Cell { Empty = 0, X = 1, O = 2 }
+
+    public class TicTacToe
+    {
+        public Cell[] Board = new Cell[9];
+        public Cell CurrentPlayer = Cell.X;
+
+        public TicTacToe()
+        {
+            Reset();
+        }
+
+        public void Reset()
+        {
+            for (int i = 0; i < 9; i++)
+                Board[i] = Cell.Empty;
+
+            CurrentPlayer = Cell.X;
+        }
+
+        public List<int> GetLegalMoves()
+        {
+            var moves = new List<int>();
+            for (int i = 0; i < 9; i++)
+                if (Board[i] == Cell.Empty)
+                    moves.Add(i);
+            return moves;
+        }
+
+        public bool MakeMove(int index)
+        {
+            if (Board[index] != Cell.Empty)
+                return false;
+
+            Board[index] = CurrentPlayer;
+            CurrentPlayer = (CurrentPlayer == Cell.X) ? Cell.O : Cell.X;
+            return true;
+        }
+
+        public Cell CheckWinner()
+        {
+            int[][] wins = new int[][]
+            {
+            new[]{0,1,2}, new[]{3,4,5}, new[]{6,7,8}, // rows
+            new[]{0,3,6}, new[]{1,4,7}, new[]{2,5,8}, // columns
+            new[]{0,4,8}, new[]{2,4,6}                // diagonals
+            };
+
+            foreach (var w in wins)
+            {
+                if (Board[w[0]] != Cell.Empty &&
+                    Board[w[0]] == Board[w[1]] &&
+                    Board[w[1]] == Board[w[2]])
+                    return Board[w[0]];
+            }
+
+            // draw
+            if (GetLegalMoves().Count == 0)
+                return Cell.Empty;
+
+            // game not finished
+            return (Cell)(-1);
+        }
+
+        public void Print()
+        {
+            for (int i = 0; i < 9; i++)
+            {
+                char c = Board[i] switch
+                {
+                    Cell.X => 'X',
+                    Cell.O => 'O',
+                    _ => '.'
+                };
+
+                Console.Write(c);
+                if (i % 3 == 2) Console.WriteLine();
+            }
+            Console.WriteLine();
+        }
+    }
+    public class FractalAgent
+    {
+        private readonly MultiAgentFractalCore core;
+        private readonly BoardEncoder encoder;
+        private readonly int hiddenSize;
+        private readonly int reasoningOrder;
+
+        public FractalAgent(int hiddenSize, int maxDepth, int reasoningOrder = 1)
+        {
+            this.hiddenSize = hiddenSize;
+            this.reasoningOrder = reasoningOrder;
+
+            core = new MultiAgentFractalCore(hiddenSize, maxDepth, agentCount: 5);
+            encoder = new BoardEncoder(hiddenSize);
+        }
+
+        public int ChooseMove(TicTacToe game)
+        {
+            var moves = game.GetLegalMoves();
+
+            float bestScore = float.NegativeInfinity;
+            int bestMove = moves[0];
+
+            foreach (var move in moves)
+            {
+                var next = (Cell[])game.Board.Clone();
+                next[move] = game.CurrentPlayer;
+
+                var state = encoder.forward(next); // [1,H]
+
+                // Ordnung der Inferenz wählbar
+                var global = core.forward(state, orderK: reasoningOrder); // [1,H]
+                var score = global.mean().ToSingle();
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestMove = move;
+                }
+            }
+
+            return bestMove;
+        }
+    }
+    public class FractalOpponent : nn.Module
+    {
+        private readonly UnifiedMultiHeadTransformerLSTMCell cell;
+        private readonly CombinatorialPathGate pathGate;
+        private readonly Linear depthGate;
+
+        private readonly int hiddenSize;
+        private readonly int maxDepth;
+
+        public FractalOpponent(int hiddenSize, int maxDepth)
+            : base("fractal_opponent")
+        {
+            this.hiddenSize = hiddenSize;
+            this.maxDepth = maxDepth;
+
+            // dein unified Cell (mit Multihead + Fractal-Memory)
+            cell = new UnifiedMultiHeadTransformerLSTMCell(
+                inputSize: hiddenSize,
+                hiddenSize: hiddenSize,
+                numHeads: 4
+            );
+
+            // pathGate arbeitet auf einem Vektor [B,H]
+            // basisCount und depth kannst du wie gehabt tunen
+            pathGate = new CombinatorialPathGate(
+                hiddenSize: hiddenSize,
+                basisCount: 4,
+                depth: maxDepth
+            );
+
+            // entscheidet, ob wir noch tiefer rekursiv gehen
+            depthGate = nn.Linear(hiddenSize, 1);
+
+            RegisterComponents();
+        }
+
+        /// <summary>
+        /// Eine rekursive Fraktal-Schicht:
+        /// x : Eingabe (z.B. Board-Embedding oder globaler Zustand)
+        /// h,c : aktueller Zustand dieses Gegners
+        /// depth : aktuelle Rekursionstiefe
+        /// </summary>
+        public (Tensor h, Tensor c) forward(Tensor x, Tensor h, Tensor c, int depth = 1)
+        {
+            // 1) Ein Schritt durch deinen Unified-Cell
+            (var hStep, var cNext) = cell.forward_step(x, h, c);
+
+            // 2) Combinatorial Path Gate über hStep
+            var hPath = pathGate.forward(hStep); // [1,H]
+
+            // 3) Tiefer gehen? (CT-Depth-Gate)
+            var gDepth = depthGate.forward(hPath).sigmoid(); // [1,1]
+            bool canGoDeeper = depth < maxDepth;
+            bool shouldGoDeeper = canGoDeeper && gDepth.ToSingle() > 0.5f;
+
+            if (shouldGoDeeper)
+            {
+                // 4) rekursiv tiefer – hPath als neue Eingabe
+                (var hDeep, var cDeep) = forward(hPath, hPath, cNext, depth + 1);
+
+                // 5) Mischung aus "oberflächlichem" und "tiefem" Zustand
+                var hBlend = 0.5f * hPath + 0.5f * hDeep;
+                return (hBlend, cDeep);
+            }
+            else
+            {
+                // keine weitere Rekursion – benutze hPath
+                return (hPath, cNext);
+            }
+        }
+    }
+
+
+    // ------------------------------------------------------------
+    // CLEAN SINE SERIES GENERATOR
+    // ------------------------------------------------------------
+    public static (int[] tokens, float[] values) GenerateSineSeries(
+        int samplesPerWave = 32,
+        int numWaves = 20,
+        int vocabSize = 100)
+    {
+        var tokenizer = new SineTokenizer(vocabSize);
+
+        int length = samplesPerWave * numWaves;
+
+        float[] values = new float[length];
+        int[] tokens = new int[length];
+
+        for (int i = 0; i < length; i++)
+        {
+            float phase = (float)i / samplesPerWave;
+            float y = MathF.Sin(phase * 2f * MathF.PI);
+            values[i] = y;
+            tokens[i] = tokenizer.Encode(y);
+        }
+
+        return (tokens, values);
+    }
+
+    /*public class UnifiedMultiHeadTransformerLSTMCell : nn.Module
+    {
+        private readonly LSTMCell lstm;
+
+        public readonly int hiddenSize;
+        private readonly int numHeads;
+        private readonly int headDim;
+
+        private readonly Linear Wq;
+        private readonly Linear Wk;
+        private readonly Linear Wv;
+        private readonly Linear attnProj;
+        public readonly Linear output;
+
+        private readonly Linear ff1;
+        private readonly Linear ff2;
+
+        private readonly LayerNorm norm1;
+        private readonly LayerNorm norm2;
+
+        private readonly List<Tensor> memory = new List<Tensor>();
+
+        public UnifiedMultiHeadTransformerLSTMCell(int inputSize, int hiddenSize, int numHeads, int outputSize = 1)
+            : base("unified_multihead_transformer_lstm_cell")
+        {
+            this.hiddenSize = hiddenSize;
+            this.numHeads = numHeads;
+            this.headDim = hiddenSize / numHeads;
+            this.outputSize = outputSize;
+
+            lstm = nn.LSTMCell(inputSize, hiddenSize);
+
+            Wq = nn.Linear(hiddenSize, hiddenSize);
+            Wk = nn.Linear(hiddenSize, hiddenSize);
+            Wv = nn.Linear(hiddenSize, hiddenSize);
+            attnProj = nn.Linear(hiddenSize, hiddenSize);
+
+            ff1 = nn.Linear(hiddenSize, hiddenSize * 4);
+            ff2 = nn.Linear(hiddenSize * 4, hiddenSize);
+            output = nn.Linear(hiddenSize, outputSize);
+
+            norm1 = nn.LayerNorm(new long[] { hiddenSize });
+            norm2 = nn.LayerNorm(new long[] { hiddenSize });
+
+            RegisterComponents();
+        }
+
+        // SINGLE-STEP FORWARD: use this in training
+        public (Tensor h, Tensor c) forward_step(Tensor x, Tensor h, Tensor c)
+        {
+            // 1. LSTM step
+            (h, c) = lstm.forward(x, (h, c));
+
+            // 2. Add hidden state to memory (no grad)
+            memory.Add(h.detach());
+
+            // 3. Multi‑Head Attention over memory
+            var M = torch.stack(memory.ToArray(), 0); // [T,B,H] or [T,H] depending on h shape
+            if (M.dim() == 3)
+                M = M.squeeze(1); // assume B=1 → [T,H]
+
+            var Q = Wq.forward(h).view(1, numHeads, headDim);                 // [1,Hh,D]
+            var K = Wk.forward(M).view(M.shape[0], numHeads, headDim);        // [T,Hh,D]
+            var V = Wv.forward(M).view(M.shape[0], numHeads, headDim);        // [T,Hh,D]
+
+            var Kperm = K.permute(1, 0, 2); // [Hh,T,D]
+            var Qperm = Q.permute(1, 0, 2); // [Hh,1,D]
+
+            var headContexts = new List<Tensor>();
+
+            for (int head = 0; head < numHeads; head++)
+            {
+                var K_h = Kperm.index(torch.TensorIndex.Single(head)); // [T,D]
+                var Q_h = Qperm.index(torch.TensorIndex.Single(head)); // [1,D]
+
+                var scores = torch.matmul(K_h, Q_h.transpose(0, 1)) / Math.Sqrt(headDim);
+                var weights = scores.softmax(0).detach(); // [T,1]
+
+                var V_h = V.index(
+                    torch.TensorIndex.Colon,
+                    torch.TensorIndex.Single(head),
+                    torch.TensorIndex.Colon
+                ); // [T,D]
+
+                var ctx_h = (weights * V_h).sum(new long[] { 0 }).unsqueeze(0); // [1,D]
+
+                headContexts.Add(ctx_h);
+            }
+
+            var context = torch.cat(headContexts.ToArray(), 1); // [1,H]
+
+            // 4. Residual + LayerNorm
+            var h1 = norm1.forward(h + attnProj.forward(context));
+
+            // 5. Feed‑Forward (Transformer)
+            var ff = ff2.forward(ff1.forward(h1).relu());
+
+            // 6. Residual + LayerNorm
+            var hFinal = norm2.forward(h1 + ff);
+
+            return (hFinal, c);
+        }
+
+        // SEQUENCE FORWARD: optional, for [T,B,inputSize]
+        public (Tensor h, Tensor c, Tensor[] outputs) forward(Tensor x)
+        {
+            // x: [T, B, inputSize]
+            int T = (int)x.shape[0];
+            int B = (int)x.shape[1];
+
+            var h = torch.zeros(B, hiddenSize);
+            var c = torch.zeros(B, hiddenSize);
+
+            var outputs = new Tensor[T];
+
+            ResetMemory();
+
+            for (int t = 0; t < T; t++)
+            {
+                var x_t = x[t]; // [B,inputSize]
+                (h, c) = forward_step(x_t, h, c);
+                outputs[t] = h;
+            }
+
+            return (h, c, outputs);
+        }
+
+        public void ResetMemory()
+        {
+            memory.Clear();
+        }
+    }*/
+
+    public class UnifiedMultiHeadTransformerLSTMCell : nn.Module
+    {
+        private const int BufferSize = 16;
+
+        private readonly LSTMCell lstm;
+        public readonly int hiddenSize;
+        private readonly int numHeads;
+        private readonly int headDim;
+        private readonly int fractalDepth;
+
+        // level-0 attention
+        private readonly MultiheadAttention level0Attn;
+
+        // compressors per level
+        private readonly List<MultiheadAttention> compressors = new List<MultiheadAttention>();
+
+        // ring buffers per level
+        private readonly Tensor?[][] buffers; // raw buffers [level][slot]
+        private readonly bool[][] bufferFilled;
+        private readonly int[] writeIndices;
+
+        // compressed buffers per level (separate from raw)
+        private readonly Tensor?[][] buffersCompressed; // compressed buffers [level][slot]
+        private readonly bool[][] bufferCompressedFilled;
+        private readonly int[] writeIndicesCompressed;
+
+        // CT-gate
+        private readonly Linear W_ct_gate;
+        private readonly Linear W_ct_compress;
+        private readonly Linear W_ct_expand;
+
+        // output projection
+        public readonly Linear output;
+
+        public UnifiedMultiHeadTransformerLSTMCell(int inputSize, int hiddenSize, int numHeads, int fractalDepth = 3, int outputSize = 1)
+            : base("unified_multihead_transformer_lstm_cell")
+        {
+            this.hiddenSize = hiddenSize;
+            this.numHeads = numHeads;
+            this.headDim = Math.Max(1, hiddenSize / Math.Max(1, numHeads));
+            this.fractalDepth = Math.Max(1, fractalDepth);
+
+            // core LSTM
+            lstm = nn.LSTMCell(inputSize, hiddenSize);
+
+            // level-0 attention and per-level compressors
+            level0Attn = nn.MultiheadAttention(hiddenSize, numHeads);
+            var compList = new ModuleList<MultiheadAttention>();
+            for (int i = 0; i < this.fractalDepth; i++)
+            {
+                compList.Add(nn.MultiheadAttention(hiddenSize, numHeads));
+            }
+            // expose as ModuleList for parameter registration
+            compressors = new List<MultiheadAttention>(compList);
+
+            // allocate raw buffers
+            buffers = new Tensor?[this.fractalDepth][];
+            bufferFilled = new bool[this.fractalDepth][];
+            writeIndices = new int[this.fractalDepth];
+            for (int i = 0; i < this.fractalDepth; i++)
+            {
+                buffers[i] = new Tensor?[BufferSize];
+                bufferFilled[i] = new bool[BufferSize];
+                writeIndices[i] = 0;
+            }
+
+            // allocate compressed buffers (separate)
+            buffersCompressed = new Tensor?[this.fractalDepth][];
+            bufferCompressedFilled = new bool[this.fractalDepth][];
+            writeIndicesCompressed = new int[this.fractalDepth];
+            for (int i = 0; i < this.fractalDepth; i++)
+            {
+                buffersCompressed[i] = new Tensor?[BufferSize];
+                bufferCompressedFilled[i] = new bool[BufferSize];
+                writeIndicesCompressed[i] = 0;
+            }
+
+            // CT-gate sizes: compress into bottleneck and expand back
+            int bottleneck = Math.Max(1, hiddenSize / 4);
+            W_ct_gate = nn.Linear(inputSize + hiddenSize, hiddenSize);
+            W_ct_compress = nn.Linear(hiddenSize, bottleneck);
+            W_ct_expand = nn.Linear(bottleneck, hiddenSize);
+
+            output = nn.Linear(hiddenSize, outputSize);
+
+            RegisterComponents();
+        }
+
+        // Helper: stack valid entries for a level into tensor [seq, batch, hidden] (raw)
+        private Tensor? StackBuffer(int level)
+        {
+            var valid = new List<Tensor>();
+            for (int i = 0; i < BufferSize; i++)
+            {
+                if (bufferFilled[level][i] && !(buffers[level][i] is null))
+                    valid.Add(buffers[level][i]!.unsqueeze(0)); // ensure [1,B,H]
+            }
+
+            if (valid.Count == 0)
+                return null;
+
+            // concatenate to [seq, batch, hidden]
+            return torch.cat(valid.ToArray(), 0);
+        }
+
+        // Helper: stack valid entries for a level into tensor [seq, batch, hidden] (compressed)
+        private Tensor? StackCompressedBuffer(int level)
+        {
+            var valid = new List<Tensor>();
+            for (int i = 0; i < BufferSize; i++)
+            {
+                if (bufferCompressedFilled[level][i] && !(buffersCompressed[level][i] is null))
+                    valid.Add(buffersCompressed[level][i]!.unsqueeze(0)); // ensure [1,B,H]
+            }
+
+            if (valid.Count == 0)
+                return null;
+            return torch.cat(valid.ToArray(), 0);
+        }
+
+        private void WriteBuffer(int level, Tensor t)
+        {
+            // dispose existing tensor at slot to avoid memory leak
+            var slot = writeIndices[level];
+            if (buffers[level][slot] is not null)
+            {
+                try { buffers[level][slot]!.Dispose(); } catch { }
+                buffers[level][slot] = null;
+                bufferFilled[level][slot] = false;
+            }
+
+            // store detached copy with shape [batch,hidden] into RAW buffers
+            buffers[level][slot] = t.detach();
+            bufferFilled[level][slot] = true;
+            writeIndices[level] = (writeIndices[level] +  1) % BufferSize;
+        }
+
+        private void WriteCompressedBuffer(int level, Tensor t)
+        {
+            // dispose existing tensor at slot to avoid memory leak
+            var slot = writeIndicesCompressed[level];
+            if (buffersCompressed[level][slot] is not null)
+            {
+                try { buffersCompressed[level][slot]!.Dispose(); } catch { }
+                buffersCompressed[level][slot] = null;
+                bufferCompressedFilled[level][slot] = false;
+            }
+
+            // store detached copy with shape [batch,hidden] into COMPRESSED buffers
+            buffersCompressed[level][slot] = t.detach();
+            bufferCompressedFilled[level][slot] = true;
+            writeIndicesCompressed[level] = (writeIndicesCompressed[level] + 1) % BufferSize;
+        }
+
+        // main forward_step per specification
+        public (Tensor h, Tensor c) forward_step(Tensor x_t, Tensor h, Tensor c)
+        {
+            // 1) LSTM update
+            (var h_lstm, var c_next) = lstm.forward(x_t, (h, c));
+
+            // Ensure shapes: h_lstm [B,H]
+
+            // 2) write into level-0 RAW buffer
+            WriteBuffer(0, h_lstm);
+
+            // 3) compute level-0 attention compressed representation (use RAW buffer only)
+            Tensor h_attn;
+            {
+                var kv = StackBuffer(0); // raw buffer
+                if (kv is null)
+                {
+                    // empty buffer -> fallback to lstm
+                    h_attn = h_lstm;
+                }
+                else
+                {
+                    // kv: [S, B, H], q: [1,B,H]
+                    var q = h_lstm.unsqueeze(0);
+                    var attnRes = level0Attn.forward(q, kv, kv, null, false, null);
+                    var attnOut = attnRes.Item1;
+                    h_attn = attnOut.squeeze(0);
+                }
+            }
+
+            // 4) cross-attention compression for all levels
+            var compressed = new Tensor[this.fractalDepth];
+            for (int i = 0; i < this.fractalDepth; i++)
+            {
+                Tensor? kv;
+                if (i == 0)
+                {
+                    // Level 0 compression reads from RAW level-0 buffer
+                    kv = StackBuffer(0);
+                }
+                else
+                {
+                    // Higher levels compress from previous COMPRESSED level
+                    kv = StackCompressedBuffer(i - 1);
+                }
+
+                if (kv is null)
+                {
+                    // empty -> use zeros
+                    compressed[i] = torch.zeros_like(h_lstm);
+                }
+                else
+                {
+                    var q = h_lstm.unsqueeze(0); // [1,B,H]
+                    var compRes = compressors[i].forward(q, kv, kv, null, false, null);
+                    var compOut = compRes.Item1; // [1,B,H]
+                    var outS = compOut.squeeze(0);
+                    compressed[i] = outS;
+
+                    // write compressed into COMPRESSED buffer for this level
+                    WriteCompressedBuffer(i, outS);
+                }
+            }
+
+            // 5) CT-GATE using deepest compressed
+            var deepest = compressed[this.fractalDepth - 1]; // [B,H]
+            var gateInput = torch.cat(new Tensor[] { x_t, h_attn }, 1); // [B, input+H]
+            var g = torch.sigmoid(W_ct_gate.forward(gateInput)); // [B,H]
+
+            var compressedSmall = W_ct_compress.forward(deepest); // [B, bottleneck]
+            var expanded = W_ct_expand.forward(compressedSmall);  // [B,H]
+                                                                  // Correct blending: mix expanded with compressedSmall (broadcasted)
+            int csDim = (int)compressedSmall.shape[1];
+            int rep = (hiddenSize + csDim - 1) / csDim;
+            var compressedSmallExpanded = compressedSmall.repeat(1, rep).narrow(1, 0, hiddenSize);
+            var h_ct = g * expanded + (1 - g) * compressedSmallExpanded; // blend expanded with compressedSmall (broadcasted)
+
+            // 6) final blend: average of h_lstm, h_attn, h_ct and all compressed levels
+            var ensemble = new List<Tensor> { h_lstm, h_attn, h_ct };
+            ensemble.AddRange(compressed);
+
+            var stacked = torch.stack(ensemble.ToArray(), 0); // [N, B, H]
+            var h_final = stacked.mean(new long[] { 0 }); // [B,H]
+
+            return (h_final, c_next);
+        }
+
+        public void ResetMemory()
+        {
+            for (int lvl = 0; lvl < this.fractalDepth; lvl++)
+            {
+                writeIndices[lvl] = 0;
+                writeIndicesCompressed[lvl] = 0;
+                for (int s = 0; s < BufferSize; s++)
+                {
+                    bufferFilled[lvl][s] = false;
+                    if (buffers[lvl][s] is not null)
+                    {
+                        try { buffers[lvl][s]!.Dispose(); } catch { }
+                        buffers[lvl][s] = null;
+                    }
+
+                    bufferCompressedFilled[lvl][s] = false;
+                    if (buffersCompressed[lvl][s] is not null)
+                    {
+                        try { buffersCompressed[lvl][s]!.Dispose(); } catch { }
+                        buffersCompressed[lvl][s] = null;
+                    }
+                }
+            }
+        }
+    }
+    public class MultiAgentFractalCore : nn.Module
+    {
+        private readonly List<FractalOpponent> agents;
+
+        private readonly Linear crossAttentionQ;
+        private readonly Linear crossAttentionK;
+        private readonly Linear crossAttentionV;
+
+        private readonly Linear globalFuse;
+
+        private readonly int hiddenSize;
+        private readonly int agentCount;
+
+        public MultiAgentFractalCore(int hiddenSize, int maxDepth, int agentCount)
+            : base("multi_agent_fractal_core")
+        {
+            this.hiddenSize = hiddenSize;
+            this.agentCount = agentCount;
+
+            agents = new List<FractalOpponent>();
+            for (int i = 0; i < agentCount; i++)
+                agents.Add(new FractalOpponent(hiddenSize, maxDepth));
+
+            crossAttentionQ = nn.Linear(hiddenSize, hiddenSize);
+            crossAttentionK = nn.Linear(hiddenSize, hiddenSize);
+            crossAttentionV = nn.Linear(hiddenSize, hiddenSize);
+
+            // flatten(A*H) -> H
+            globalFuse = nn.Linear(hiddenSize * agentCount, hiddenSize);
+
+            RegisterComponents();
+        }
+
+        /// <summary>
+        /// Ein Reasoning-Schritt über alle Agenten:
+        /// - jeder Agent macht seinen Fraktal-Schritt
+        /// - danach Cross-Attention zwischen allen Agenten
+        /// - daraus entsteht ein globaler Zustand
+        /// </summary>
+        private (Tensor[] hNext, Tensor[] cNext, Tensor global) ReasonOnce(
+            Tensor x,
+            Tensor[] hCur,
+            Tensor[] cCur)
+        {
+            var hLocal = new Tensor[agentCount];
+            var cNext = new Tensor[agentCount];
+
+            // 1) Jeder Agent updatet seinen internen Zustand
+            for (int i = 0; i < agentCount; i++)
+            {
+                (hLocal[i], cNext[i]) = agents[i].forward(x, hCur[i], cCur[i]);
+            }
+
+            // 2) Cross-Agent-Attention
+            var H = torch.cat(hLocal, 0); // [A,H]
+
+            var Q = crossAttentionQ.forward(H); // [A,H]
+            var K = crossAttentionK.forward(H); // [A,H]
+            var V = crossAttentionV.forward(H); // [A,H]
+
+            var scores = torch.matmul(Q, K.transpose(0, 1)); // [A,A]
+            var weights = scores.softmax(1);                 // [A,A]
+
+            var H_attn = torch.matmul(weights, V); // [A,H]
+
+            // 3) Aktualisierte Hidden-States nach wechselseitigem Denken
+            var hNext = new Tensor[agentCount];
+            for (int i = 0; i < agentCount; i++)
+            {
+                var h_i = H_attn.index(torch.TensorIndex.Single(i)).unsqueeze(0); // [1,H]
+                hNext[i] = h_i;
+            }
+
+            // 4) Globaler Zustand: alle Agenten zusammen
+            var H_flat = H_attn.flatten(0, 1).unsqueeze(0); // [1, A*H]
+            var global = globalFuse.forward(H_flat).tanh(); // [1,H]
+
+            return (hNext, cNext, global);
+        }
+
+        /// <summary>
+        /// Generalisierte Ordnung: orderK = wie oft ReasonOnce angewendet wird.
+        /// orderK = 1 -> 1st order
+        /// orderK = 2 -> 2nd order (jeder denkt über die anderen nach, nachdem alle einmal gedacht haben)
+        /// usw.
+        /// </summary>
+        public Tensor forward(Tensor x, int orderK = 1)
+        {
+            var h = new Tensor[agentCount];
+            var c = new Tensor[agentCount];
+
+            for (int i = 0; i < agentCount; i++)
+            {
+                h[i] = torch.zeros(1, hiddenSize);
+                c[i] = torch.zeros(1, hiddenSize);
+            }
+
+            Tensor global = torch.zeros(1, hiddenSize);
+
+            int steps = Math.Max(1, orderK);
+            for (int k = 0; k < steps; k++)
+            {
+                (h, c, global) = ReasonOnce(x, h, c);
+            }
+
+            return global; // [1,H]
+        }
+    }
+
+
+    // ------------------------------------------------------------
+    // SINGLE-BAND LSTM MODEL
+    // ------------------------------------------------------------
+    public class SineLSTMModel : nn.Module
+    {
+        private readonly Module embedding;
+        private readonly LSTMCell[] layers;
+        private readonly Module outputLayer;
+
+        public readonly int hiddenSize;
+        public readonly int vocabSize;
+        public readonly int numLayers;
+
+        public SineLSTMModel(int vocabSize, int hiddenSize, int numLayers = 2) : base("sine_lstm")
+        {
+            this.vocabSize = vocabSize;
+            this.hiddenSize = hiddenSize;
+            this.numLayers = Math.Max(1, numLayers);
+
+            embedding = nn.Embedding(vocabSize, hiddenSize);
+
+            layers = new LSTMCell[this.numLayers];
+            for (int i = 0; i < this.numLayers; i++)
+            {
+                // all layers have hidden size as both input and output here (embedding dim == hiddenSize)
+                layers[i] = nn.LSTMCell(hiddenSize, hiddenSize);
+            }
+
+            outputLayer = nn.Linear(hiddenSize, vocabSize);
+
+            // expose layers array for RegisterComponents to pick up
+            RegisterComponents();
+        }
+
+        // tokenIdx: [1] or [B]
+        // h, c: [numLayers, B, hiddenSize]
+        public (Tensor logits, Tensor h, Tensor c) forward(Tensor tokenIdx, Tensor h, Tensor c)
+        {
+            var emb = ((Module<Tensor, Tensor>)embedding).forward(tokenIdx); // [B,hidden]
+
+            int B = (int)emb.shape[0];
+
+            var newHs = new Tensor[this.numLayers];
+            var newCs = new Tensor[this.numLayers];
+
+            var input = emb;
+
+            for (int l = 0; l < this.numLayers; l++)
+            {
+                // extract per-layer hidden/cell [B,hidden]
+                var h_l = h.index(torch.TensorIndex.Single(l));
+                var c_l = c.index(torch.TensorIndex.Single(l));
+
+                var (hOut, cOut) = layers[l].forward(input, (h_l, c_l));
+
+                newHs[l] = hOut;
+                newCs[l] = cOut;
+
+                // next layer input is this layer's output
+                input = hOut;
+            }
+
+            var hTop = newHs[this.numLayers - 1];
+            var logits = ((Module<Tensor, Tensor>)outputLayer).forward(hTop);
+
+            var stackedH = torch.stack(newHs, 0);
+            var stackedC = torch.stack(newCs, 0);
+
+            return (logits, stackedH, stackedC);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // TRAINING LOOP
+    // ------------------------------------------------------------
+    public static void TrainSineTokenModel()
+    {
+        int vocabSize = 100;
+        int hiddenSize = 64;
+
+        var (tokens, _) = GenerateSineSeries(
+            samplesPerWave: 128,
+            numWaves: 20,
+            vocabSize: vocabSize);
+
+        int seqLen = tokens.Length;
+
+        TrainSingleBand(tokens, vocabSize, hiddenSize, seqLen);
+    }
+
+    // ------------------------------------------------------------
+    // SINGLE-BAND TRAINING
+    // ------------------------------------------------------------
+    private static void TrainSingleBand(int[] tokens, int vocabSize, int hiddenSize, int seqLen)
+    {
+        var tokenizer = new SineTokenizer(vocabSize);
+
+        var device = torch.cuda.is_available() ? torch.CUDA : torch.CPU;
+
+        var model = new SineLSTMModel(vocabSize, hiddenSize, numLayers: 2).to(device);
+        var optimizer = torch.optim.Adam(model.parameters(), lr: 0.003);
+
+        for (int epoch = 0; epoch < 200; epoch++)
+        {
+            model.zero_grad();
+
+            var h = torch.zeros(new long[] { model.numLayers, 1, hiddenSize }, device: device);
+            var c = torch.zeros(new long[] { model.numLayers, 1, hiddenSize }, device: device);
+
+            Tensor totalLoss = torch.zeros(new long[] { 1 }, device: device);
+
+            int start = 0;
+            int length = seqLen - 1;
+
+            for (int t = start; t < start + length; t++)
+            {
+                var inputIdx = torch.tensor(new long[] { tokens[t] }).to(device);
+                var targetIdx = torch.tensor(new long[] { tokens[t + 1] }).to(device);
+
+                var (logits, h2, c2) = model.forward(inputIdx, h, c);
+
+                var loss = nn.functional.cross_entropy(logits, targetIdx);
+                totalLoss += loss;
+
+                // ---------------- DEBUG PRINT ----------------
+                if (t < 5) // only first few steps per epoch
+                {
+                    int predicted = logits.argmax(1).ToInt32();
+
+                    Console.WriteLine(
+                        $"[Epoch {epoch}] t={t} | " +
+                        $"Input={tokenizer.Decode(tokens[t]):F4} | " +
+                        $"Expected={tokenizer.Decode(tokens[t + 1]):F4} | " +
+                        $"Predicted={tokenizer.Decode(predicted):F4}");
+                }
+                // ------------------------------------------------
+
+                h = h2;
+                c = c2;
+            }
+
+            var avgLoss = totalLoss / length;
+
+            avgLoss.backward();
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0);
+            optimizer.step();
+
+            Console.WriteLine($"[Single] Epoch {epoch} AvgLoss: {avgLoss.ToSingle():F4}");
+        }
+
+        int startToken = tokens[64];
+        PredictFutureSingle(model, startToken, 300);
+    }
+
+    // ------------------------------------------------------------
+    // PREDICTION (SINGLE LSTM)
+    // ------------------------------------------------------------
+    public static void PredictFutureSingle(SineLSTMModel model, int startToken, int steps)
+    {
+        int vocabSize = model.vocabSize;
+        var tokenizer = new SineTokenizer(vocabSize);
+
+        var device = torch.CPU;
+
+        var h = torch.zeros(new long[] { model.numLayers, 1, model.hiddenSize }, device: device);
+        var c = torch.zeros(new long[] { model.numLayers, 1, model.hiddenSize }, device: device);
+
+        int token = startToken;
+
+        Console.WriteLine("\nFuture predictions (Single LSTM):");
+
+        for (int i = 0; i < steps; i++)
+        {
+            var inputIdx = torch.tensor(new long[] { token }).to(device);
+
+            var (logits, h2, c2) = model.forward(inputIdx, h, c);
+
+            token = logits.argmax(1).ToInt32();
+
+            float value = tokenizer.Decode(token);
+            Console.WriteLine($"{i}: {value:F4}");
+
+            h = h2;
+            c = c2;
+        }
+    }
+
+    // Save model state_dict into multiple part directories each not exceeding maxBytes (default 2GB)
+    public static void SaveModelWeightsLimited(nn.Module model, string basePath, long maxBytes = 2L * 1024 * 1024 * 1024)
+    {
+        var state = model.state_dict(); // IDictionary<string, Tensor>
+
+        // base directory for parts
+        var dirBase = basePath + ".parts";
+        if (!Directory.Exists(dirBase)) Directory.CreateDirectory(dirBase);
+
+        int part = 0;
+        string currentDir = Path.Combine(dirBase, $"part{part}");
+        Directory.CreateDirectory(currentDir);
+
+        foreach (var kv in state)
+        {
+            var key = kv.Key;
+            var tensor = kv.Value;
+
+            var safeName = Uri.EscapeDataString(key) + ".pt"; // encode key into filename
+            var fullPath = Path.Combine(currentDir, safeName);
+
+            // save tensor
+            torch.save(tensor, fullPath);
+
+            // compute directory size
+            long dirSize = 0;
+            try { dirSize = Directory.EnumerateFiles(currentDir).Sum(f => new FileInfo(f).Length); } catch { dirSize = 0; }
+
+            if (dirSize > maxBytes)
+            {
+                var files = Directory.GetFiles(currentDir);
+                if (files.Length == 1)
+                {
+                    // single tensor exceeds limit; leave it (can't split tensor)
+                }
+                else
+                {
+                    // move last saved file to new part
+                    part++;
+                    var newDir = Path.Combine(dirBase, $"part{part}");
+                    Directory.CreateDirectory(newDir);
+                    var newPath = Path.Combine(newDir, safeName);
+                    try { File.Move(fullPath, newPath); } catch { }
+                    currentDir = newDir;
+                }
+            }
+        }
+    }
+
+    // Load part directories produced by SaveModelWeightsLimited and load into model
+    public static void LoadModelWeightsLimited(nn.Module model, string basePath)
+    {
+        var dirBase = basePath + ".parts";
+
+        var merged = new Dictionary<string, Tensor>();
+
+        if (Directory.Exists(dirBase))
+        {
+            var partDirs = Directory.GetDirectories(dirBase).OrderBy(d => d);
+            foreach (var pd in partDirs)
+            {
+                var files = Directory.GetFiles(pd).OrderBy(f => f);
+                foreach (var f in files)
+                {
+                    var fname = Path.GetFileNameWithoutExtension(f);
+                    var key = Uri.UnescapeDataString(fname);
+                    var t = torch.load(f) as Tensor;
+                    if (t is not null) merged[key] = t;
+                }
+            }
+        }
+        else
+        {
+            // fallback: single file state dict
+            var single = basePath + ".pt";
+            if (File.Exists(single))
+            {
+                var dict = torch.load(single) as IDictionary<string, Tensor>;
+                if (dict != null)
+                {
+                    foreach (var kv in dict) merged[kv.Key] = kv.Value;
+                }
+            }
+        }
+
+        if (merged.Count > 0)
+        {
+            model.load_state_dict(merged, strict: false);
+        }
+    }
+
+
+    public class WordTokenizer
+    {
+        private readonly Dictionary<string, int> stoi = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> itos = new List<string>();
+
+        // reserve 0 for <unk>
+        public const string UnknownToken = "<unk>";
+        public int VocabSize => itos.Count;
+
+        public WordTokenizer()
+        {
+            itos.Add(UnknownToken);
+            stoi[UnknownToken] = 0;
+        }
+
+        // Build from corpus of texts; simple whitespace split and lowercasing
+        public void BuildVocabulary(IEnumerable<string> texts, int maxVocab = 10000)
+        {
+            var freq = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var t in texts)
+            {
+                if (string.IsNullOrWhiteSpace(t)) continue;
+                var parts = t.Split(new[] { ' ', '\t', '\n', '\r', ',', '.', '!', '?', ';', ':', '"', '\'' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var p in parts)
+                {
+                    var w = p.Trim().ToLowerInvariant();
+                    if (w.Length == 0) continue;
+                    if (!freq.TryGetValue(w, out var c)) c = 0;
+                    freq[w] = c + 1;
+                }
+            }
+
+            var ordered = freq.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key).Take(maxVocab);
+
+            foreach (var kv in ordered)
+            {
+                if (!stoi.ContainsKey(kv.Key))
+                {
+                    itos.Add(kv.Key);
+                    stoi[kv.Key] = itos.Count - 1;
+                }
+            }
+        }
+
+        public int Encode(string word)
+        {
+            if (string.IsNullOrEmpty(word)) return 0;
+            var w = word.ToLowerInvariant();
+            if (stoi.TryGetValue(w, out var id)) return id;
+            return 0; // unknown
+        }
+
+        public string Decode(int token)
+        {
+            if (token < 0 || token >= itos.Count) return UnknownToken;
+            return itos[token];
+        }
+
+        public int[] Tokenize(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return Array.Empty<int>();
+            var parts = text.Split(new[] { ' ', '\t', '\n', '\r', ',', '.', '!', '?', ';', ':', '"', '\'' }, StringSplitOptions.RemoveEmptyEntries);
+            var ids = new List<int>(parts.Length);
+            foreach (var p in parts)
+            {
+                ids.Add(Encode(p));
+            }
+            return ids.ToArray();
+        }
+
+        public string Detokenize(IEnumerable<int> tokens)
+        {
+            return string.Join(' ', tokens.Select(t => Decode(t)));
+        }
+
+        // allow adding words manually
+        public int AddWord(string word)
+        {
+            var w = word.ToLowerInvariant();
+            if (stoi.TryGetValue(w, out var id)) return id;
+            itos.Add(w);
+            id = itos.Count - 1;
+            stoi[w] = id;
+            return id;
+        }
+    }
+}

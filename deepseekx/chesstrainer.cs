@@ -1,12 +1,12 @@
-/*using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using ChessDotNet;
 using TorchSharp;
 using static TorchSharp.torch;
 
-// Simple chess self-play trainer using FractalOpponent.
-// Runs self-play games between two FractalOpponents and performs a lightweight training step
+// Simple chess self-play trainer using MultiAgentFractalCore (two internal FractalOpponents).
+// Runs self-play games between the two internal agents and performs a lightweight training step
 // that rewards moves taken by the eventual winner.
 public static class ChessTrainer
 {
@@ -61,8 +61,10 @@ public static class ChessTrainer
         return torch.tensor(vec).unsqueeze(0); // [1, hiddenSize]
     }
 
-    // Plays a single self-play game between white and black opponents. Returns list of chosen hidden states for each side and the result.
-    private static (List<Tensor> whiteStates, List<bool> whiteCaptures, List<Tensor> blackStates, List<bool> blackCaptures, int result) PlayGame(FractalOpponent white, FractalOpponent black, int hiddenSize, int maxMoves = 400)
+    // Plays a single self-play game between agent 0 (white) and agent 1 (black) inside MultiAgentFractalCore.
+    // Returns list of chosen hidden states for each side and the result.
+    private static (List<Tensor> whiteStates, List<bool> whiteCaptures, List<Tensor> blackStates, List<bool> blackCaptures, int result)
+        PlayGame(MultiAgentFractalCore core, int hiddenSize, int maxMoves = 400)
     {
         var game = new ChessGame();
 
@@ -74,10 +76,13 @@ public static class ChessTrainer
         int whiteCaptureCount = 0;
         int blackCaptureCount = 0;
 
-        var hWhite = torch.zeros(1, hiddenSize);
-        var cWhite = torch.zeros(1, hiddenSize);
-        var hBlack = torch.zeros(1, hiddenSize);
-        var cBlack = torch.zeros(1, hiddenSize);
+        var hAgents = new Tensor[2];
+        var cAgents = new Tensor[2];
+        for (int i = 0; i < 2; i++)
+        {
+            hAgents[i] = torch.zeros(1, hiddenSize);
+            cAgents[i] = torch.zeros(1, hiddenSize);
+        }
 
         int moveCounter = 0;
 
@@ -92,6 +97,8 @@ public static class ChessTrainer
             double bestScore = double.NegativeInfinity;
             Move bestMove = legal[0];
 
+            int agentIndex = (player == Player.White) ? 0 : 1;
+
             foreach (var mv in legal)
             {
                 var copy = new ChessGame(game.GetFen());
@@ -101,17 +108,19 @@ public static class ChessTrainer
                 // evaluate with a fresh zero state to avoid mutating persistent state during search
                 var h0 = torch.zeros(1, hiddenSize);
                 var c0 = torch.zeros(1, hiddenSize);
-                (Tensor hCand, Tensor cCand) res;
 
-                res = (player == Player.White) ? white.forward(input, h0, c0) : black.forward(input, h0, c0);
+                var (outTensor, hCand, cCand) = core.EvaluateAgent(agentIndex, input, h0, c0);
 
-                var scoreTensor = res.Item1.mean();
+                var scoreTensor = outTensor.mean();
                 double score = scoreTensor.ToSingle();
                 if (score > bestScore)
                 {
                     bestScore = score;
                     bestMove = mv;
                 }
+
+                // dispose temporaries
+                outTensor.Dispose(); hCand.Dispose(); cCand.Dispose(); input.Dispose(); h0.Dispose(); c0.Dispose();
             }
 
             // detect capture on target square (if any)
@@ -130,7 +139,7 @@ public static class ChessTrainer
                         var targetPiece = game.GetPieceAt(pos);
                         if (targetPiece != null) isCapture = true;
                     }
-                    catch { /* ignore API differences */ /*}
+                    catch { /* ignore API differences */ }
                 }
             }
             catch { isCapture = false; }
@@ -138,70 +147,11 @@ public static class ChessTrainer
             // apply best move to real game
             game.MakeMove(bestMove, true);
 
-            // print game state after move
+            // print game state after move (best-effort)
             try
             {
                 var fenAfter = game.GetFen();
-
-                // format FEN board part into an 8x8 matrix-like ASCII view
-                var partsAfter = fenAfter.Split(' ');
-                var boardPartAfter = partsAfter.Length > 0 ? partsAfter[0] : fenAfter;
-                var ranks = boardPartAfter.Split('/');
-
                 Console.WriteLine($"Move {moveCounter + 1}: {player} -> {bestMove}. FEN: {fenAfter}");
-
-                // print board as matrix with ranks from 8 to 1 (colored)
-                var defaultBg = Console.BackgroundColor;
-                var defaultFg = Console.ForegroundColor;
-
-                for (int r = 0; r < ranks.Length; r++)
-                {
-                    var rank = ranks[r];
-                    var row = new List<string>();
-                    foreach (var ch in rank)
-                    {
-                        if (char.IsDigit(ch))
-                        {
-                            int empty = ch - '0';
-                            for (int e = 0; e < empty; e++) row.Add(".");
-                        }
-                        else
-                        {
-                            row.Add(ch.ToString());
-                        }
-                    }
-
-                    // print files a..h for this rank with alternating background
-                    for (int file = 0; file < row.Count; file++)
-                    {
-                        var s = row[file];
-                        bool lightSquare = ((r + file) % 2 == 0);
-                        Console.BackgroundColor = lightSquare ? ConsoleColor.DarkGray : ConsoleColor.DarkGreen;
-
-                        if (s == ".")
-                        {
-                            Console.ForegroundColor = ConsoleColor.Gray;
-                            Console.Write(" . ");
-                        }
-                        else
-                        {
-                            char pc = s[0];
-                            if (char.IsUpper(pc)) // White piece
-                                Console.ForegroundColor = ConsoleColor.White;
-                            else
-                                Console.ForegroundColor = ConsoleColor.Yellow; // Black piece
-
-                            Console.Write($" {pc} ");
-                        }
-
-                        Console.BackgroundColor = defaultBg;
-                        Console.ForegroundColor = defaultFg;
-                    }
-                    Console.WriteLine();
-                }
-
-                // print capture stats
-                Console.WriteLine($"Captures -> White: {whiteCaptureCount}  Black: {blackCaptureCount}");
             }
             catch
             {
@@ -210,24 +160,28 @@ public static class ChessTrainer
 
             // compute new persistent state using the real board after move
             var curInput = EncodeBoard(game, hiddenSize);
-            if (player == Player.White)
+            var (outReal, hOut, cOut) = core.EvaluateAgent(agentIndex, curInput, hAgents[agentIndex], cAgents[agentIndex]);
+
+            // update persistent state and record
+            if (agentIndex == 0)
             {
-                var (hOut, cOut) = white.forward(curInput, hWhite, cWhite);
-                hWhite = hOut;
-                cWhite = cOut;
+                hAgents[0].Dispose(); cAgents[0].Dispose();
+                hAgents[0] = hOut; cAgents[0] = cOut;
                 whiteStates.Add(hOut);
                 whiteCaptures.Add(isCapture);
                 if (isCapture) whiteCaptureCount++;
             }
             else
             {
-                var (hOut, cOut) = black.forward(curInput, hBlack, cBlack);
-                hBlack = hOut;
-                cBlack = cOut;
+                hAgents[1].Dispose(); cAgents[1].Dispose();
+                hAgents[1] = hOut; cAgents[1] = cOut;
                 blackStates.Add(hOut);
                 blackCaptures.Add(isCapture);
                 if (isCapture) blackCaptureCount++;
             }
+
+            // cleanup
+            outReal.Dispose(); curInput.Dispose();
 
             moveCounter++;
 
@@ -235,6 +189,7 @@ public static class ChessTrainer
             var nextPlayer = game.WhoseTurn;
             var nextLegal = game.GetValidMoves(nextPlayer).ToArray();
             if (nextLegal.Length == 0) break;
+            if (moveCounter >= maxMoves) break;
         }
 
         // determine result: 1 white win, -1 black win, 0 draw
@@ -245,16 +200,17 @@ public static class ChessTrainer
             // Prefer using checkmate detection APIs if available
             bool whiteCheckmated = false;
             bool blackCheckmated = false;
-            try { whiteCheckmated = game.IsCheckmated(Player.White); } catch { try { whiteCheckmated = game.IsCheckmated(Player.White); } catch { } }
-            try { blackCheckmated = game.IsCheckmated(Player.Black); } catch { try { blackCheckmated = game.IsCheckmated(Player.Black); } catch { } }
+            try { whiteCheckmated = game.IsCheckmated(Player.White); } catch { }
+            try { blackCheckmated = game.IsCheckmated(Player.Black); } catch { }
 
             if (blackCheckmated) result = 1;
             else if (whiteCheckmated) result = -1;
             else
             {
-                // if no checkmate, attempt material or draw heuristics: simple: compare legal move lengths
-                // if both still have moves, treat as draw for this simplified trainer
-                result = 0;
+                // if no checkmate, attempt material or draw heuristics: simple: compare capture counts
+                if (whiteCaptureCount > blackCaptureCount) result = 1;
+                else if (blackCaptureCount > whiteCaptureCount) result = -1;
+                else result = 0;
             }
         }
         catch
@@ -266,22 +222,21 @@ public static class ChessTrainer
     }
 
     // Public entry point: run self-play training for a number of games.
-    // Each game: play self-play, then compute simple loss: encourage states (h.mean) of winner, discourage loser.
+    // Uses a shared MultiAgentFractalCore so its internal opponents learn from each other's moves.
     public static void SelfPlayTrain(int games = 10, int hiddenSize = 128, int maxDepth = 2, int maxMovesPerGame = 200)
     {
         Console.WriteLine($"Starting self-play training: games={games} hidden={hiddenSize} depth={maxDepth}");
 
-        // create two opponents
-        var white = new FractalOpponent(hiddenSize, maxDepth);
-        var black = new FractalOpponent(hiddenSize, maxDepth);
+        // create a shared core with two internal agents
+        var core = new MultiAgentFractalCore(hiddenSize, maxDepth, 2);
 
-        var parameters = white.parameters().Concat(black.parameters());
+        var parameters = core.parameters();
         var optimizer = torch.optim.Adam(parameters, lr: 1e-3);
 
         for (int g = 1; g <= games; g++)
         {
             Console.WriteLine($"=== Game {g} ===");
-            var (whiteStates, whiteCaptures, blackStates, blackCaptures, result) = PlayGame(white, black, hiddenSize, maxMovesPerGame);
+            var (whiteStates, whiteCaptures, blackStates, blackCaptures, result) = PlayGame(core, hiddenSize, maxMovesPerGame);
 
             // assemble loss
             var loss = torch.tensor(0f);
@@ -291,37 +246,18 @@ public static class ChessTrainer
             if (result == 1)
             {
                 // white won: maximize whiteStates' means, minimize blackStates
-                for (int i = 0; i < whiteStates.Count; i++)
-                {
-                    var h = whiteStates[i];
-                    loss -= h.mean();
-                    if (whiteCaptures.Count > i && whiteCaptures[i])
-                        loss -= captureReward * h.mean();
-                }
-                for (int i = 0; i < blackStates.Count; i++)
-                {
-                    var h = blackStates[i];
-                    loss += h.mean();
-                    if (blackCaptures.Count > i && blackCaptures[i])
-                        loss += captureReward * h.mean();
-                }
+                foreach (var h in whiteStates) { loss -= h.mean(); }
+                foreach (var h in blackStates) { loss += h.mean(); }
+                // encourage captures
+                for (int i = 0; i < whiteCaptures.Count; i++) if (whiteCaptures[i]) loss -= captureReward * whiteStates[i].mean();
+                for (int i = 0; i < blackCaptures.Count; i++) if (blackCaptures[i]) loss += captureReward * blackStates[i].mean();
             }
             else if (result == -1)
             {
-                for (int i = 0; i < blackStates.Count; i++)
-                {
-                    var h = blackStates[i];
-                    loss -= h.mean();
-                    if (blackCaptures.Count > i && blackCaptures[i])
-                        loss -= captureReward * h.mean();
-                }
-                for (int i = 0; i < whiteStates.Count; i++)
-                {
-                    var h = whiteStates[i];
-                    loss += h.mean();
-                    if (whiteCaptures.Count > i && whiteCaptures[i])
-                        loss += captureReward * h.mean();
-                }
+                foreach (var h in blackStates) { loss -= h.mean(); }
+                foreach (var h in whiteStates) { loss += h.mean(); }
+                for (int i = 0; i < blackCaptures.Count; i++) if (blackCaptures[i]) loss -= captureReward * blackStates[i].mean();
+                for (int i = 0; i < whiteCaptures.Count; i++) if (whiteCaptures[i]) loss += captureReward * whiteStates[i].mean();
             }
             else
             {
@@ -330,15 +266,13 @@ public static class ChessTrainer
                 {
                     var h = whiteStates[i];
                     loss += 0.0f * h.mean();
-                    if (whiteCaptures.Count > i && whiteCaptures[i])
-                        loss -= (captureReward * 0.01f) * h.mean();
+                    if (whiteCaptures[i]) loss -= (captureReward * 0.01f) * h.mean();
                 }
                 for (int i = 0; i < blackStates.Count; i++)
                 {
                     var h = blackStates[i];
                     loss += 0.0f * h.mean();
-                    if (blackCaptures.Count > i && blackCaptures[i])
-                        loss -= (captureReward * 0.01f) * h.mean();
+                    if (blackCaptures[i]) loss -= (captureReward * 0.01f) * h.mean();
                 }
             }
 
@@ -354,9 +288,12 @@ public static class ChessTrainer
             {
                 Console.WriteLine($"Training step failed: {ex.Message}");
             }
+
+            // dispose stored tensors to avoid memory leaks
+            foreach (var t in whiteStates) try { t.Dispose(); } catch { }
+            foreach (var t in blackStates) try { t.Dispose(); } catch { }
         }
 
         Console.WriteLine("Self-play training finished.");
     }
 }
-*/

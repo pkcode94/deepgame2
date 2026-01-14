@@ -31,6 +31,18 @@ public class MultiAgentFractalCore : nn.Module
     private readonly int hiddenSize;
     private readonly int agentCount;
     private static Linear globalRamanujanHead;
+
+    // Expose hidden size publicly for external users (e.g. ChessTrainer)
+    public int HiddenSize => hiddenSize;
+
+    // Allow external callers to evaluate a specific internal agent by index
+    public (Tensor output, Tensor h, Tensor c) EvaluateAgent(int agentIndex, Tensor x, Tensor h, Tensor c)
+    {
+        if (agentIndex < 0 || agentIndex >= agentCount)
+            throw new ArgumentOutOfRangeException(nameof(agentIndex));
+        return agents[agentIndex].forward(x, h, c);
+    }
+
     public static Tensor RamanujanSum(
     Tensor[] states,     // array of [1,H]
     Linear ramanujanHead // maps [1,2H] -> [1,H]
@@ -84,7 +96,7 @@ public class MultiAgentFractalCore : nn.Module
 
             if (coherence > 5.0f)
                 Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine(" --> WARNING: High Resonanz in Ramanujan Head!");
+            Console.WriteLine(" --> WARNING: High Resonance in Ramanujan Head!");
             Console.ResetColor();
         }
     }

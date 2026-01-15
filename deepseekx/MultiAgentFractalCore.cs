@@ -43,40 +43,35 @@ public class MultiAgentFractalCore : nn.Module
         return agents[agentIndex].forward(x, h, c);
     }
 
-    public static Tensor RamanujanSum(
-    Tensor[] states,     // array of [1,H]
-    Linear ramanujanHead // maps [1,2H] -> [1,H]
-)
+    public static Tensor RamanujanSum(Tensor[] states, Linear projection)
     {
-        int S = states.Length;
-        if (S == 0)
-            throw new ArgumentException("RamanujanSum: states array is empty.");
+        if (states == null || states.Length == 0)
+        {
+            long expectedInputSize = projection.weight.shape[1];
+            return torch.zeros(new long[] { 1, expectedInputSize }, device: projection.weight.device);
+        }
 
-        // Stack to [S,H]
+        // Build two EMAs over the states with different decay rates (alpha1, alpha2)
+        // Stack states to [S,H]
         var M = torch.cat(states, dim: 0); // [S,H]
 
-        // Two learnable decay params would ideally be module fields,
-        // but for a first pass we can use fixed scalars:
-        // alpha1 ~ more smoothing, alpha2 ~ less smoothing.
         float alpha1 = 0.4f;
         float alpha2 = 0.8f;
 
-        // EMA 1
-        var anchor1 = torch.zeros(1, M.shape[1]);
-        // EMA 2
-        var anchor2 = torch.zeros(1, M.shape[1]);
+        var anchor1 = torch.zeros(1, M.shape[1], device: M.device);
+        var anchor2 = torch.zeros(1, M.shape[1], device: M.device);
 
-        for (int t = 0; t < S; t++)
+        for (int t = 0; t < M.shape[0]; t++)
         {
             var h_t = M[t].unsqueeze(0); // [1,H]
             anchor1 = (1 - alpha1) * anchor1 + alpha1 * h_t;
             anchor2 = (1 - alpha2) * anchor2 + alpha2 * h_t;
         }
 
-        // Concatenate [1,H] + [1,H] -> [1,2H]
-        var concat = torch.cat(new Tensor[] { anchor1, anchor2 }, dim: 1); // [1,2H]
-        var hStar = ramanujanHead.forward(concat);                         // [1,H]
-        if (DateTime.Now.Millisecond % 5000 == 0) // Zeitbasiertes Debugging
+        // Concatenate anchors -> [1, 2H]
+        var concat = torch.cat(new Tensor[] { anchor1, anchor2 }, dim: 1);
+        var hStar = projection.forward(concat);
+        if (DateTime.Now.Millisecond % 5000 == 0)
             DebugRamanujanEnergy(states, hStar);
         return hStar;
     }

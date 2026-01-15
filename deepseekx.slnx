@@ -1,3 +1,9 @@
 <Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
   <Project Path="deepseekx/deepseekx.csproj" />
+  <Project Path="fractaltorch/fractaltorch.vcxproj" Id="26fd2c1f-328c-40db-8bf8-19b8dae07af2" />
 </Solution>

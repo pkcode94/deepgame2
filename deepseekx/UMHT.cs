@@ -224,11 +224,16 @@ public class UnifiedMultiHeadTransformerLSTMCell : nn.Module
         // 6) Final blend (ensemble of LSTM, route
         // [B,H]
 
+        // In UnifiedMultiHeadTransformerLSTMCell.forward
+        // Ersetzen Sie den finalen Blend-Abschnitt:
+
         var ensemble = new List<Tensor> { hLstm, routed, hCT };
         using var stacked = torch.stack(ensemble, 0);
         var hFinal = stacked.mean(new long[] { 0 });
 
-        // Dropout anwenden
+        // NEU: LayerNorm vor dem Dropout stabilisiert die Skalierung für den Bias
+        hFinal = torch.nn.functional.layer_norm(hFinal, new long[] { HiddenSize });
+
         hFinal = nn.functional.dropout(hFinal, 0.2, this.training);
 
         // Korrektur der Rückgabewerte:

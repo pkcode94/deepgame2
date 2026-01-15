@@ -1,6 +1,5 @@
 ﻿using deepseekx;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -12,8 +11,8 @@ using TorchSharp;
 using TorchSharp.Modules;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn;
-using static TorchSharp.torch.optim;
 using static TorchSharp.torch.optim.lr_scheduler.impl.CyclicLR;
+using Microsoft.ML.OnnxRuntime;
 //
 // ===============================================================
 //  TOKEN-BASED SINE LSTM (STABLE VERSION + DEBUG PRINTS)
@@ -213,110 +212,7 @@ public class Program
         var sim = dot / denom;
         return sim.ToSingle();
     }
-    public static (List<Tensor> inputs, List<float> targets) GetMandelbrotTrajectory(float cx, float cy, int steps = 64)
-    {
-        var inputs = new List<Tensor>();
-        var targets = new List<float>();
 
-        float zx = 0, zy = 0;
-
-        for (int i = 0; i < steps; i++)
-        {
-            // 1. Aktuellen Zustand speichern (Input für das Modell)
-            var inputVec = torch.zeros(new long[] { 1, 64 });
-            inputVec[0, 0] = torch.tensor(cx);
-            inputVec[0, 1] = torch.tensor(cy);
-            // Wir begrenzen auch die Inputs, damit das Modell keine astronomischen Zahlen sieht
-            inputVec[0, 2] = torch.tensor(Math.Clamp(zx, -2.1f, 2.1f));
-            inputVec[0, 3] = torch.tensor(Math.Clamp(zy, -2.1f, 2.1f));
-
-            inputs.Add(inputVec);
-
-            // 2. Nächsten Schritt berechnen
-            float nextZx = zx * zx - zy * zy + cx;
-            float nextZy = 2 * zx * zy + cy;
-            zx = nextZx;
-            zy = nextZy;
-
-            // 3. Target berechnen & hart bei 2.0 deckeln
-            float magnitude = (float)Math.Sqrt(zx * zx + zy * zy);
-
-            // WICHTIG: Wenn der Wert > 2 ist, setzen wir ihn fest auf 2.0
-            // Das ist das Signal für das Modell: "Ziel erreicht, Punkt ist raus."
-            targets.Add(Math.Min(magnitude, 2.0f));
-        }
-
-        return (inputs, targets);
-    }
-    public static void RunMandelbrotTrajectoryTest(FractalOpponent predictor)
-    {
-        // Stabile Learning Rate für tiefe Rekursion
-        var optimizer = torch.optim.Adam(predictor.parameters(), lr: 1e-4);
-
-        torch.manual_seed(42);
-        predictor.train();
-
-        // Punkt im "Seepferdchen-Tal" (komplexes Grenzverhalten)
-        float cx = -0.743643887037151f;
-        float cy = 0.131825904205311f;
-
-        for (int epoch = 0; epoch < 1000; epoch++)
-        {
-            optimizer.zero_grad();
-            var (inputs, targets) = GetMandelbrotTrajectory(cx, cy, 64);
-
-            var h = torch.zeros(new long[] { 1, 64 });
-            var c = torch.zeros(new long[] { 1, 64 });
-
-            var predictions = new List<Tensor>();
-            Tensor? lastInputTensor = null;
-
-            for (int t = 0; t < 64; t++)
-            {
-                if (t == 63) lastInputTensor = inputs[t].clone();
-
-                var (pred, hNext, cNext) = predictor.forward(inputs[t], h, c);
-                predictions.Add(pred.mean());
-
-                h = hNext;
-                c = cNext;
-
-                inputs[t].Dispose();
-            }
-
-            var predictionTensor = torch.stack(predictions).view(-1);
-            var targetTensor = torch.tensor(targets.ToArray());
-
-            var loss = torch.nn.functional.mse_loss(predictionTensor, targetTensor);
-
-            loss.backward();
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm: 1.0);
-            optimizer.step();
-
-                float finalPred = predictionTensor[0].item<float>();
-                float finalTarget = targets[0];
-
-                Console.WriteLine($"\n--- Epoch {epoch:D3} ---");
-                Console.WriteLine($"Loss: {loss.item<float>():F8}");
-
-                // Gegenüberstellung: Vorhersage vs. Erwartung am Ende der 64 Schritte
-                Console.WriteLine($"Step 63 -> [Expected: {finalTarget:F4}] | [Predicted: {finalPred:F4}]");
-
-                if (lastInputTensor is not null)
-                {
-                    var data = lastInputTensor.data<float>();
-                    //Console.WriteLine($"Last State (t=63) -> cx: {data[0]:F4}, cy: {data[1]:F4}, zx: {data[2]:F4}, zy: {data[3]:F4}");
-                    lastInputTensor.Dispose();
-                }
-            
-
-            // Cleanup
-            predictionTensor.Dispose();
-            targetTensor.Dispose();
-            h.Dispose();
-            c.Dispose();
-        }
-    }
     public static void TestPrediction(UnifiedMultiHeadTransformerLSTMCell cell)
     {
         int seqLen = 20;
@@ -417,11 +313,7 @@ public class Program
 
         // include embedding parameters in optimizer
         var parameters = cell.parameters().Concat(((Module)embedding).parameters());
-        var opt = torch.optim.Adam(
-    parameters,
-    lr: 1e-4,
-    amsgrad: true // Hilft gegen das -1.0000 Bias Problem
-);
+        var opt = torch.optim.Adam(parameters, lr: 1e-4);
 
         for (int epoch = 1; epoch <= epochs; epoch++)
         {
@@ -692,153 +584,61 @@ public class Program
 
         return inputs;
     }
-    public static Tensor WeightMatchingLoss(nn.Module teacher, nn.Module student, float lambda)
+    public static void TrainFractalAutoregressive(
+    FractalOpponent generator,
+    FractalOpponent predictor,
+    Embedding tokenEmbedding,
+    int seqLen = 30)
     {
-        Tensor total = torch.tensor(0f);
-
-        var tDict = teacher.state_dict();
-        var sDict = student.state_dict();
-
-        foreach (var key in tDict.Keys)
-        {
-            if (!sDict.ContainsKey(key)) continue;
-
-            var t = tDict[key];
-            var s = sDict[key];
-
-            // MSE between teacher and student weights
-            total += lambda * torch.nn.functional.mse_loss(s, t);
-        }
-
-        return total;
-    }
-    public static void CompareWeights(nn.Module teacher, nn.Module student)
-    {
-        var tDict = teacher.state_dict();
-        var sDict = student.state_dict();
-
-        Console.WriteLine("=== Weight Convergence Debug ===");
-
-        foreach (var key in tDict.Keys)
-        {
-            if (!sDict.ContainsKey(key))
-            {
-                Console.WriteLine($"Missing key in student: {key}");
-                continue;
-            }
-
-            var t = tDict[key];
-            var s = sDict[key];
-
-            // Cosine similarity between flattened weights
-            var sim = Program.CosineSimilarity(t.flatten(), s.flatten());
-            var diff = (t - s).pow(2).mean().ToSingle();
-
-            Console.WriteLine($"{key,-40} | cos={sim:F4} | mse={diff:F6}");
-        }
-    }
-    public static void TrainFractalSupervisedFixedInput(
-        FractalOpponent generator,
-        FractalOpponent predictor,
-        Embedding tokenEmbedding,
-        int seqLen = 6)
-    {
+        var optimizer = torch.optim.Adam(predictor.parameters().Concat(tokenEmbedding.parameters()), lr: 5e-5);
         var device = torch.CPU;
 
-        // Freeze generator params (teacher)
-        foreach (var p in generator.parameters())
-            p.requires_grad = false;
-
-        var opt = torch.optim.Adam(
-            predictor.parameters().Concat(tokenEmbedding.parameters()),
-            lr: 1e-4
-        );
-
-        var inputTokens = Enumerable.Repeat(1, seqLen).ToArray();
-        float lambda = 1e-4f;
-        float entropyCoef = 0.05f;
-
-        for (int epoch = 0; epoch < 2000; epoch++)
+        for (int epoch = 0; epoch < 100; epoch++)
         {
-            opt.zero_grad();
+            optimizer.zero_grad();
+            var totalLoss = torch.zeros(new long[] { 1 }).to(device);
 
-            var hGen = torch.zeros(new long[] { 1, generator.hiddenSize }).to(device);
-            var cGen = torch.zeros(new long[] { 1, generator.hiddenSize }).to(device);
+            // State Init
+            var hGen = torch.zeros(new long[] { 1, 32 }); var cGen = torch.zeros(new long[] { 1, 32 });
+            var hPred = torch.zeros(new long[] { 1, 32 }); var cPred = torch.zeros(new long[] { 1, 32 });
 
-            var hPred = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
-            var cPred = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
+            // Startpunkt
+            var currentTokenGen = torch.tensor(new long[] { 0 }).to(device);
+            var currentTokenPred = torch.tensor(new long[] { 0 }).to(device);
 
-            Tensor totalLoss = torch.tensor(0f).to(device);
-            float seriesMseAccumulator = 0f; // Für den reinen Vorhersage-Loss
-
-            // Speicher für die finale Ausgabe (für Debug-Print)
-            float lastExpected = 0f;
-            float lastGotten = 0f;
-            float avgSeriesLoss =0f;
             for (int t = 0; t < seqLen; t++)
             {
-                var idx = torch.tensor(new long[] { inputTokens[t] }).to(device);
-                var emb = tokenEmbedding.forward(idx);
+                // 1. Lehrer erzeugt "Wahrheit"
+                var inputGen = tokenEmbedding.forward(currentTokenGen);
+                var (outGen, hG, cG) = generator.forward(inputGen, hGen, cGen);
+                var nextTokenGen = outGen.argmax(1);
 
-                // 1. Teacher Step
-                var (outGen, hGenNext, cGenNext) = generator.forward(emb, hGen, cGen);
+                // 2. Schüler erzeugt "Vorhersage" basierend auf seiner EIGENEN letzten Entscheidung
+                var inputPred = tokenEmbedding.forward(currentTokenPred);
+                var (outPred, hP, cP) = predictor.forward(inputPred, hPred, cPred);
+                var nextTokenPred = outPred.argmax(1);
 
-                // 2. Student Step
-                var (outPred, hPredNext, cPredNext) = predictor.forward(emb, hPred, cPred);
+                // 3. Loss Berechnung
+                // Wir bestrafen die Abweichung der Wahrscheinlichkeitsverteilung (outPred) 
+                // vom idealen Zielzustand des Lehrers (outGen)
+                totalLoss += torch.nn.functional.mse_loss(outPred, outGen.detach());
 
-                // 3. Output Matching (Series Loss)
-                var stepMse = torch.nn.functional.mse_loss(outPred, outGen.detach());
-                totalLoss += stepMse;
-                seriesMseAccumulator += stepMse.item<float>();
+                // 4. PRINT Logik
+             
+                    Console.WriteLine($"T={t} | Exp: {nextTokenGen.item<long>()} | Got: {nextTokenPred.item<long>()}");
+                
 
-                // Werte für den Print am Ende der Sequenz merken
-                if (t == seqLen - 1)
-                {
-                    lastExpected = outGen.mean().item<float>(); // Mittelwert als Repräsentant
-                    lastGotten = outPred.mean().item<float>();
-                }
+                // 5. Autoregressives Update
+                hGen = hG.detach(); cGen = cG.detach();
+                currentTokenGen = nextTokenGen.detach();
 
-                // --- ROUTER ENTROPY ---
-                var depthLogits = predictor.lastdepthlogits;
-                if (depthLogits is not null)
-                {
-                    var probs = torch.nn.functional.softmax(depthLogits, dim: 1);
-                    var logProbs = torch.nn.functional.log_softmax(depthLogits, dim: 1);
-                    var entropy = -(probs * logProbs).sum();
-                    totalLoss -= entropyCoef * entropy;
-                }
-
-                hGen = hGenNext;
-                cGen = cGenNext;
-                hPred = hPredNext;
-                cPred = cPredNext;
-
-                avgSeriesLoss = seriesMseAccumulator / seqLen;
-
+                hPred = hP; cPred = cP;
+                // Der Schüler "lebt" in seiner eigenen Vorhersage
+                currentTokenPred = nextTokenPred.detach();
             }
 
-            // 4. Weight Matching Loss
-            var wLoss = WeightMatchingLoss(generator, predictor, lambda);
-            totalLoss += wLoss;
-
-            // 5. Backward Pass
             totalLoss.backward();
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm: 1.0);
-            opt.step();
-
-            // --- DEBUG OUTPUT ---
-            Console.WriteLine($"\nEpoch {epoch} -----------------------------------");
-            Console.WriteLine($"[LOSS] Total: {totalLoss.item<float>():F6} | Series MSE: {avgSeriesLoss:F8}");
-
-            // Print Input, Expected, Gotten
-            // Da Input hier fix ist (Token 1), printen wir die skalaren Repräsentationen
-            Console.WriteLine($"[DATA] Input Token: {inputTokens[0]} (Sequence Len: {seqLen})");
-            Console.WriteLine($"[PRED] Expected (Teacher Avg): {lastExpected:F6}");
-            Console.WriteLine($"[PRED] Gotten   (Student Avg): {lastGotten:F6}");
-            Console.WriteLine($"[DIFF] Delta: {Math.Abs(lastExpected - lastGotten):F6}");
-
-            CompareWeights(generator, predictor);
-
+            optimizer.step();
         }
     }
     public static int[] GenerateComplexSineTokens(int count, int vocabSize)
@@ -858,8 +658,6 @@ public class Program
     }
     public static void Main(string[] args)
     {
-        RunMandelbrotTrajectoryTest(new FractalOpponent(64, 3));
-        return;
         int H = 32;
         int vocabSize = 100;
         int maxDepth = 3;
@@ -876,9 +674,8 @@ public class Program
 
         int[] tokens = GenerateComplexSineTokens(1000, vocabSize);
 
-         TrainFractalSupervisedFixedInput(generator,predictor, sharedEmbedding, 100);
-
         // Aufruf
+        TrainFractalAutoregressive(generator, predictor, sharedEmbedding, 30);
         return;
         // Note: Do NOT start the Fractal API server automatically.
         // Starting the webserver enables the external tokenizer and can change tokenizer behavior.

@@ -8,6 +8,7 @@ namespace deepseekx
 {
     public class FractalAgent
     {
+
         private readonly MultiAgentFractalCore core;
         private readonly BoardEncoder encoder;
         private readonly int hiddenSize;

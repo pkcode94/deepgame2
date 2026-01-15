@@ -6,6 +6,10 @@ using static TorchSharp.torch.optim.lr_scheduler.impl;
 
 public class CombinatorialPathGate : nn.Module
 {
+
+    public bool OverrideRouting { get; set; } = false;
+    public int ForcedExpert { get; set; } = 0;
+
     private readonly int hiddenSize;
     private readonly int numExperts;
 
@@ -35,9 +39,9 @@ public class CombinatorialPathGate : nn.Module
     }
 
     // forward: x shape [B,H] or [H]
-    public int LastWinningExpert { get; private set; }
-    public float LastGateValue { get; private set; }
-    public int LastWinnerExpert { get; private set; }
+    public int LastWinningExpert { get; set; }
+    public float LastGateValue { get; set; }
+    public int LastWinnerExpert { get; set; }
     public Tensor forward(Tensor x)
     {
         Tensor t = x;

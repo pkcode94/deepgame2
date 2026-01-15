@@ -44,40 +44,58 @@ public class MultiAgentFractalCore : nn.Module
     }
 
     public static Tensor RamanujanSum(
-    Tensor[] states,     // array of [1,H]
-    Linear ramanujanHead // maps [1,2H] -> [1,H]
-)
+     Tensor[] states,      // array of [1,H]
+     Linear ramanujanHead  // maps [1,2H] -> [1,H]
+ )
     {
         int S = states.Length;
         if (S == 0)
             throw new ArgumentException("RamanujanSum: states array is empty.");
 
-        // Stack to [S,H]
-        var M = torch.cat(states, dim: 0); // [S,H]
+        // 1. Device & Type Safety
+        var device = states[0].device;
+        var dtype = states[0].dtype;
+        var hiddenSize = states[0].shape[1];
 
-        // Two learnable decay params would ideally be module fields,
-        // but for a first pass we can use fixed scalars:
-        // alpha1 ~ more smoothing, alpha2 ~ less smoothing.
-        float alpha1 = 0.4f;
-        float alpha2 = 0.8f;
+        // 2. Erzeuge gedämpfte Koeffizienten (Exponential Decay)
+        // Anstatt nur zwei EMAs nutzen wir eine gewichtete Aggregation, 
+        // die tiefere Rekursionsebenen progressiv abschwächt.
+        var anchor1 = torch.zeros(new long[] { 1, hiddenSize }, dtype: dtype, device: device);
+        var anchor2 = torch.zeros(new long[] { 1, hiddenSize }, dtype: dtype, device: device);
 
-        // EMA 1
-        var anchor1 = torch.zeros(1, M.shape[1]);
-        // EMA 2
-        var anchor2 = torch.zeros(1, M.shape[1]);
+        // Lernbare Parameter-Simmulation (Stabilisierungswerte)
+        float alpha1 = 0.3f; // Stärkere Glättung für Langzeit-Stabilität
+        float alpha2 = 0.7f; // Schnellere Reaktion auf aktuelle Tiefe
 
         for (int t = 0; t < S; t++)
         {
-            var h_t = M[t].unsqueeze(0); // [1,H]
-            anchor1 = (1 - alpha1) * anchor1 + alpha1 * h_t;
-            anchor2 = (1 - alpha2) * anchor2 + alpha2 * h_t;
+            // Wir nutzen .alias(), um Speicher-Kopien zu vermeiden, aber den Graph zu erhalten
+            using var h_t = states[t].alias();
+
+            // Dämpfungsfaktor: Verhindert, dass die Summe bei hoher Tiefe explodiert
+            // Jede Ebene wird um 10% mehr gedämpft als die vorherige
+            float depthDamping = (float)Math.Pow(0.9, t);
+
+            anchor1 = (1 - alpha1) * anchor1 + alpha1 * h_t * depthDamping;
+            anchor2 = (1 - alpha2) * anchor2 + alpha2 * h_t * depthDamping;
         }
 
-        // Concatenate [1,H] + [1,H] -> [1,2H]
+        // 3. Normalisierung (Wichtig gegen "High Resonance")
+        // Wir teilen durch die theoretische Summe der Gewichte, damit der Output-Scale [1,H] bleibt
+        anchor1 = anchor1 / (1e-6f + (float)S);
+        anchor2 = anchor2 / (1e-6f + (float)S);
+
+        // 4. Concatenate & Projection
         var concat = torch.cat(new Tensor[] { anchor1, anchor2 }, dim: 1); // [1,2H]
-        var hStar = ramanujanHead.forward(concat);                         // [1,H]
-        if (DateTime.Now.Millisecond % 5000 == 0) // Zeitbasiertes Debugging
+        var hStar = ramanujanHead.forward(concat);                        // [1,H]
+
+        // 5. Residual-Check & Debugging
+        if (DateTime.Now.Millisecond % 5000 == 0)
+        {
+            // Debugging-Logik aufrufen
             DebugRamanujanEnergy(states, hStar);
+        }
+
         return hStar;
     }
     public static void DebugRamanujanEnergy(Tensor[] states, Tensor ramanujanOutput)

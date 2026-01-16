@@ -5,6 +5,11 @@ using static TorchSharp.torch;
 
 public class FractalOpponent : nn.Module
 {
+    // In FractalOpponent.cs oder als separater Layer:
+    public readonly Linear outputHead;
+
+// Im Konstruktor initialisieren:
+
     public int LastDepthChosen { get; set; } = 0;
     public bool DisableButterfly { get; set; } = false;
     public bool DisableDepth { get; set; } = false;
@@ -38,7 +43,8 @@ public class FractalOpponent : nn.Module
         // NEW: Ramanujan head for depth [1,2H] -> [1,H]
         depthRamanujanHead = nn.Linear(hiddenSize * 2, hiddenSize);
         depthAnchorGate = nn.Linear(hiddenSize * 2, hiddenSize);
-        RegisterComponents();
+        this.outputHead = nn.Linear(hiddenSize, 4); // 4 = A, C, G, T (no N class)
+        this.RegisterComponents();
 
     }
 
@@ -84,113 +90,93 @@ public class FractalOpponent : nn.Module
 
     public (Tensor output, Tensor h, Tensor c) forward(Tensor x, Tensor h, Tensor c, int depth = 0)
     {
-        // === 1) Shallow pass ===
-        var (shallowOut, hShallow, cShallow) = cell.forward_step(x, h, c);
+        // Defensive checks to surface null references early with helpful messages
+        if (x is null) throw new ArgumentNullException(nameof(x), "Input tensor x is null in FractalOpponent.forward");
+        if (h is null) throw new ArgumentNullException(nameof(h), "Hidden state h is null in FractalOpponent.forward");
+        if (c is null) throw new ArgumentNullException(nameof(c), "Cell state c is null in FractalOpponent.forward");
+        if (cell is null) throw new InvalidOperationException("UnifiedMultiHeadTransformerLSTMCell 'cell' is null. Ensure FractalOpponent was constructed properly.");
+        if (butterflyGate is null) DisableButterfly = true; // fallback to disable
+        if (pathGate is null) DisablePathGate = true;
+        if (depthRouter is null) DisableDepth = true;
+        if (depthRamanujanHead is null) throw new InvalidOperationException("depthRamanujanHead is null. The FractalOpponent must initialize all heads.");
+        if (depthAnchorGate is null) throw new InvalidOperationException("depthAnchorGate is null. The FractalOpponent must initialize all gates.");
 
-        // === 2) Path Gate ===
-        Tensor hPath;
-        if (DisablePathGate)
+        // === 1) Path-Gate (Kombinatorische Experten-Auswahl) ===
+        // Das Path-Gate transformiert h basierend auf der aktuellen Experten-Logik
+        var hCur = h;
+        if (!DisablePathGate)
         {
-            hPath = hShallow.alias();
-            LastWinningExpert = -1;
+            hCur = pathGate.forward(h);
+            this.LastWinningExpert = pathGate.LastWinningExpert;
+        }
+
+        // === 2) Butterfly-Gate mit Sensitivitäts-Schutz ===
+        // Das Butterfly-Gate ruft die Lambda-Funktion intern ZWEIMAL auf (Base & Perturbed).
+        // Wir umschließen das, um den internen Speicher der Cell zu schützen.
+        Tensor hNext;
+        if (!DisableButterfly)
+        {
+            hNext = butterflyGate.forward(hCur, (hIn) =>
+            {
+                // WICHTIG: Flag setzen, damit der rollierende Speicher (memK/memV) 
+                // in der Zelle während der Sensitivitätsprüfung nicht modifiziert wird.
+                cell.IsInSensitivityCheck = true;
+
+                // Ein Einzelschritt durch die UMHT-Zelle
+                var (stepOut, _, _) = cell.forward_step(x, hIn, c, null, null);
+
+                cell.IsInSensitivityCheck = false; // Flag zurücksetzen
+                return stepOut;
+            }, depth);
         }
         else
         {
-            hPath = pathGate.forward(hShallow);
-            LastWinningExpert = pathGate.LastWinningExpert;
+            // Falls Butterfly deaktiviert ist, normaler Schritt
+            var (stepOut, _, _) = cell.forward_step(x, hCur, c, null, null);
+            hNext = stepOut;
         }
 
-        // === 3) Depth Decision (Korrigiert für 64-Bit Input) ===
-        int steps = 0;
-        if (!DisableDepth)
+        // === 3) Rekursive Tiefe (Fractal Depth) ===
+        var depthStates = new List<Tensor> { hNext };
+        if (!DisableDepth && depth < maxDepth)
         {
-            // Da wir hier noch keinen echten Anker haben, füllen wir mit Nullen auf (Padding)
-            // um auf die vom Router erwarteten 64 Features zu kommen.
-            using (var padding = torch.zeros_like(hPath))
-            using (var routerInput = torch.cat(new Tensor[] { hPath, padding }, 1))
-            using (var depthLogits = depthRouter.forward(routerInput))
-            using (var depthProbs = depthLogits.softmax(1))
-            using (var depthIdx = depthProbs.argmax(1))
+            // Der Router entscheidet, ob wir tiefer in die fraktale Struktur gehen
+            // Wir nutzen hierfür den aktuellen Zustand und ein kleines MLP
+            var depthGateInput = torch.cat(new Tensor[] { hNext, c }, dim: 1);
+            using (var logits = depthRouter.forward(depthGateInput))
             {
-                // Speichern für den Entropy-Loss im Trainer
-                lastdepthlogits = depthLogits.detach();
+                var probs = torch.nn.functional.softmax(logits, dim: 1);
+                int chosenDepth = (int)probs.argmax(1).item<long>();
+                this.LastDepthChosen = chosenDepth;
 
-                int chosenDepth = (int)depthIdx.item<long>();
-                int remaining = Math.Max(0, maxDepth - depth);
-                steps = Math.Min(chosenDepth, remaining);
+                if (chosenDepth > 0)
+                {
+                    // Rekursiver Aufruf: Das Modell "überlegt" tiefer
+                    var (hSub, _, _) = this.forward(x, hNext, c, depth + 1);
+                    depthStates.Add(hSub);
+                    hNext = hSub;
+                }
             }
         }
 
-        // Wenn keine Rekursion gewählt wurde, sofort zurückkehren
-        if (steps <= 0)
-        {
-            return (shallowOut.alias(), hPath.alias(), cShallow.alias());
-        }
-
-        // === 4) Recursive refinement ===
-        var hCur = hPath.alias();
-        var cCur = cShallow.alias();
-        var finalOut = shallowOut.alias();
-
-        var depthStates = new List<Tensor>();
-        depthStates.Add(hCur.alias());
-
-        for (int i = 0; i < steps; i++)
-        {
-            // Butterfly Gate kapselt die Rekursion
-            Tensor UpdateFn(Tensor hLocal)
-            {
-                var (outRec, hNextRec, _) = forward(x, hLocal, cCur, depth + 1);
-                // Wir müssen hier vorsichtig sein: outRec muss entsorgt werden, wenn nicht genutzt
-                outRec.Dispose();
-                return hNextRec;
-            }
-
-            Tensor hNext;
-            if (DisableButterfly)
-            {
-                hNext = UpdateFn(hCur);
-            }
-            else
-            {
-                hNext = butterflyGate.forward(hCur, UpdateFn, depth);
-            }
-
-            depthStates.Add(hNext.alias());
-
-            // Altes hCur entsorgen, um Memory Leaks zu vermeiden
-            hCur.Dispose();
-            hCur = hNext;
-        }
-
-        // === 5) Ramanujan depth anchor ===
-        // Hier wird die Summe gebildet (Input pro State: 32, Output: 32)
+        // === 4) Ramanujan Depth Anchor (Stabilitäts-Kern) ===
+        // Wir fassen die Zustände der verschiedenen Tiefen über eine Ramanujan-Summe zusammen
         var hDepthAnchor = MultiAgentFractalCore.RamanujanSum(depthStates.ToArray(), depthRamanujanHead);
 
-        // === 6) Depth Anchor Gate (Finaler Check: 32 + 32 = 64) ===
-        // Multipliziere hDepthAnchor mit einem Dämpfungsfaktor (z.B. 0.3), 
-        // bevor er ins Gate geht, oder dämpfe das Gate selbst.
+        // Dämpfung und Kombination von aktuellem h und dem "Erinnerungs-Anker"
         var dampedAnchor = hDepthAnchor * 0.3f;
-        var depthGateInput = torch.cat(new Tensor[] { hCur, dampedAnchor }, dim: 1);
-        // WICHTIG: Die Logits nochmals mit dem echten Anker aktualisieren für genaueren Loss
-        using (var finalLogits = depthRouter.forward(depthGateInput))
+        var finalGateInput = torch.cat(new Tensor[] { hNext, dampedAnchor }, dim: 1);
+
+        using (var gRaw = depthAnchorGate.forward(finalGateInput))
+        using (var g = gRaw.sigmoid())
         {
-            lastdepthlogits?.Dispose(); // Altes Padding-Logit entsorgen
-            lastdepthlogits = finalLogits.detach();
-        }
+            // Mischung aus aktuellem Pfad und tieferem Anker
+            var hFinal = g * dampedAnchor + (1.0f - g) * hNext;
 
-        // Das Gate entscheidet, wie stark der Anker den aktuellen Zustand beeinflusst
-        using (var depthGateRaw = depthAnchorGate.forward(depthGateInput))
-        using (var depthG = depthGateRaw.sigmoid())
-        {
-            // hOut = g * anchor + (1-g) * hCur
-            var hOut = depthG * hDepthAnchor + (1 - depthG) * hCur;
+            // Finaler LayerNorm für numerische Stabilität
+            var hOut = torch.nn.functional.layer_norm(hFinal, new long[] { hiddenSize });
 
-            // Cleanup
-            foreach (var d in depthStates) d.Dispose();
-            hDepthAnchor.Dispose();
-
-            return (finalOut, hOut, cCur);
+            return (hOut, hOut, c);
         }
     }
 }

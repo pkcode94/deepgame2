@@ -9,151 +9,222 @@ using static TorchSharp.torch;
 
 public static class GenomicEngine
 {
-    // Mapping: A=1, C=2, G=3, T=4, N=0
+    // 1. Define the IDs strictly
+    private const int ID_A = 0;
+    private const int ID_C = 1;
+    private const int ID_G = 2;
+    private const int ID_T = 3;
+
+    // 2. Map characters to those IDs
     private static readonly Dictionary<char, long> BaseToId = new Dictionary<char, long> {
-        {'A', 1}, {'C', 2}, {'G', 3}, {'T', 4}, {'N', 0},
-        {'a', 1}, {'c', 2}, {'g', 3}, {'t', 4}, {'n', 0}
+        {'A', ID_A}, {'C', ID_C}, {'G', ID_G}, {'T', ID_T},
+        {'a', ID_A}, {'c', ID_C}, {'g', ID_G}, {'t', ID_T}
     };
 
-    // Lädt eine FASTA Datei (ignoriert Header-Zeilen mit '>')
-    public static string LoadFasta(string path)
-    {
-        return string.Concat(File.ReadLines(path)
-            .Where(line => !line.StartsWith(">"))
-            .Select(line => line.Trim()));
-    }
+    // 3. Map IDs back to characters in the EXACT same order
+    private static readonly char[] IndexToBase = { 'A', 'C', 'G', 'T' };
 
     public static long[] Tokenize(string sequence) =>
-        sequence.Select(c => BaseToId.GetValueOrDefault(c, 0L)).ToArray();
+        sequence.Select(c => BaseToId.GetValueOrDefault(char.ToUpper(c), 0L)).ToArray();
 
-    public static string Detokenize(long[] tokens)
+    public static char Detokenize(int index)
     {
-        var idToBase = BaseToId.GroupBy(x => x.Value).ToDictionary(x => x.Key, x => x.First().Key);
-        return new string(tokens.Select(t => idToBase.GetValueOrDefault(t, 'N')).ToArray());
+        if (index < 0 || index >= IndexToBase.Length) return 'N';
+        return IndexToBase[index];
     }
-    public static void TrainOnGenomics(
-    FractalOpponent predictor,
-    Embedding tokenEmbedding,
-    string dnaSequence,
-    int epochs = 100,
-    int windowSize = 16)
+
+public static void TrainOnGenomics(
+        FractalOpponent predictor,
+        Embedding tokenEmbedding,
+        string dnaSequence,
+        int epochs = 100,
+        int windowSize = 16)
     {
         var device = torch.CPU;
         var tokens = GenomicEngine.Tokenize(dnaSequence);
-        char[] baseMap = { 'N', 'A', 'C', 'G', 'T' };
 
-        // Parameter-Trennung
+        // Retrospektiver Speicher (Key: DNA-Position, Value: Korrekte Token-ID)
+        var retrospectiveFacts = new Dictionary<long, long>();
+        var rnd = new Random();
+
         var allParams = predictor.named_parameters().ToList();
-        var biasParams = allParams.Where(p => p.name.Contains("bias")).Select(p => p.parameter).ToList();
         var mainParams = allParams.Where(p => !p.name.Contains("bias")).Select(p => p.parameter)
                                    .Concat(tokenEmbedding.parameters()).ToList();
+        var biasParams = allParams.Where(p => p.name.Contains("bias")).Select(p => p.parameter).ToList();
 
-        float mainLr = 0.001f;
-        float biasLr = 1e-6f;
-        float biasGradScale = biasLr / mainLr;
+        var opt = torch.optim.Adam(mainParams, lr: 0.0001f);
+        var weights = torch.tensor(new float[] { 1.0f, 1.0f, 1.0f, 1.0f}).to(device);
 
-        var opt = torch.optim.Adam(mainParams, lr: mainLr, weight_decay: 1e-5f);
-
-        Console.WriteLine($"Starte Training auf {tokens.Length} Basenpaaren...");
-
+        Console.WriteLine($"Starte Training mit Retrospective Memory Loop...");
+        var h = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
+        var c = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
         for (int epoch = 0; epoch < epochs; epoch++)
         {
             for (int i = 0; i < tokens.Length - windowSize - 1; i += windowSize)
             {
+                Console.WriteLine("{0}/{1}",i, tokens.Length - windowSize - 1);
+                predictor.train();
                 opt.zero_grad();
+                h = h.detach();
+                c = c.detach();
+                // --- 1. Normaler Vorwärts-Pass ---
 
-                var hPred = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
-                var cPred = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
+                Tensor lastHidden = null;
 
-                // Input für Anzeige speichern
-                string inputContext = dnaSequence.Substring(i, windowSize);
-                long targetId = tokens[i + windowSize];
-                char expectedBase = baseMap[targetId];
-
-                Tensor lastOutput = null;
                 for (int t = 0; t < windowSize; t++)
                 {
                     var inputToken = torch.tensor(new long[] { tokens[i + t] }).to(device);
-                    var emb = tokenEmbedding.forward(inputToken);
-                    var (outPred, hNext, cNext) = predictor.forward(emb, hPred, cPred);
-                    hPred = hNext;
-                    cPred = cNext;
-                    lastOutput = outPred;
+                    var (outH, hNext, cNext) = predictor.forward(tokenEmbedding.forward(inputToken), h, c);
+                    h = hNext; c = cNext; lastHidden = outH;
                 }
 
-                var targetEmb = tokenEmbedding.forward(torch.tensor(new long[] { targetId }).to(device)).detach();
-                var loss = torch.nn.functional.huber_loss(lastOutput, targetEmb);
+                // Target und Logits
+                long targetTokenId = tokens[i + windowSize];
+                var targetTensor = torch.tensor(new long[] { targetTokenId }).to(device);
+                // Ensure hidden has shape [batch, features]
+                var hiddenFlatForHead = lastHidden.flatten(1);
+                var logits = predictor.outputHead.forward(hiddenFlatForHead);
+
+                // Loss & Backprop: use built-in cross_entropy with label smoothing
+                var loss = torch.nn.functional.cross_entropy(logits, targetTensor, weight: weights, label_smoothing: 0.1f);
 
                 loss.backward();
+                torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0);
 
-                // --- BIAS GRADIENT SCALING PATCH ---
+                // Bias Scaling
                 if (biasParams.Count > 0)
-                {
-                    foreach (var p in biasParams)
-                    {
-                        if (p.grad is not null) p.grad.mul_(biasGradScale);
-                    }
-                }
+                    foreach (var p in biasParams) if (p.grad is not null) p.grad.mul_(1e-3f);
 
-                // --- PREDICTION DETERMINATION ---
-                char predictedBase = 'N';
-                float maxSim = -1f;
-                for (int b = 1; b <= 4; b++) // A, C, G, T prüfen
-                {
-                    var bEmb = tokenEmbedding.forward(torch.tensor(new long[] { b }).to(device)).detach();
-                    float sim = torch.nn.functional.cosine_similarity(lastOutput, bEmb).item<float>();
-                    if (sim > maxSim) { maxSim = sim; predictedBase = baseMap[b]; }
-                }
-
-                // --- COLORED OUTPUT ---
-                Console.Write($"Ep {epoch} | In: {inputContext} | Exp: {expectedBase} | Got: ");
-                if (predictedBase == expectedBase) Console.ForegroundColor = ConsoleColor.Green;
-                else Console.ForegroundColor = ConsoleColor.Red;
-                Console.Write(predictedBase);
-                Console.ResetColor();
-                Console.WriteLine($" | Loss: {loss.item<float>():F6}");
-
-                torch.nn.utils.clip_grad_norm_(predictor.parameters(), 0.1);
                 opt.step();
+
+                // --- 2. Retrospective Memory Logic ---
+                if (loss.item<float>() < 0.3f)
+                    retrospectiveFacts[i + windowSize] = targetTokenId;
+
+                // Alle 10 Schritte: Ein altes Wissen "auffrischen"
+                if (i % 10 == 0 && retrospectiveFacts.Count > 0)
+                {
+                    var fact = retrospectiveFacts.ElementAt(rnd.Next(retrospectiveFacts.Count));
+                    // Wir nutzen hier einen verkleinerten Schritt für die Erinnerung
+                    //PerformMemoryReplay(predictor, tokenEmbedding, opt, tokens, (int)fact.Key, windowSize, weights, device);
+                }
+
+                    long predId = logits.argmax(1).item<long>();
+                    char predChar = GenomicEngine.Detokenize((int)predId);
+                    char expChar = GenomicEngine.Detokenize((int)targetTokenId);
+
+
+                if (predChar == expChar)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                }
+                Console.WriteLine($"Ep {epoch} | Pos {i:N0} | Loss: {loss.item<float>():F5} | Memory: {retrospectiveFacts.Count} | Exp: {expChar} | Got: {predChar}");
+
+                // Wichtig: Farbe wieder zurücksetzen für den Rest der Konsole
+                Console.ResetColor();
+
+
+                RunSimplePrediction(predictor, tokenEmbedding, "AAGCCCAATAAACCAC");
+                RunSimplePrediction(predictor, tokenEmbedding, "ACTGGCCGAATAGGGA");
+                RunSimplePrediction(predictor, tokenEmbedding, "GGCAACGACATGTGCG");
+                RunSimplePrediction(predictor, tokenEmbedding, "CCCTTGCGACAGTGAC");
+
+                RunSimplePrediction(predictor, tokenEmbedding, "TCGCCGTTGCCTAAAC");
+                RunSimplePrediction(predictor, tokenEmbedding, "TTGAAGGAGTCTAGCA");
+                RunSimplePrediction(predictor, tokenEmbedding, "TCCGTGTTACCAGACC");
+                RunSimplePrediction(predictor, tokenEmbedding, "AAGACGTCCTCTTCAA");
+                RunSimplePrediction(predictor, tokenEmbedding, "TAAATGACCCTCTCGT");
+                RunSimplePrediction(predictor, tokenEmbedding, "AAACCTTTCTACTATG");
+                RunSimplePrediction(predictor, tokenEmbedding, "AATGGCGCGTCGTGAA");
+                RunSimplePrediction(predictor, tokenEmbedding, "GCGACGGCTGAGACGA");
+                RunSimplePrediction(predictor, tokenEmbedding, "CGCGTGAATGAAGCGC");
+                RunSimplePrediction(predictor, tokenEmbedding, "ACAGCTCAGGAGCCAG");
+                RunSimplePrediction(predictor, tokenEmbedding, "CTACGTCGCATATCCT");
+                RunSimplePrediction(predictor, tokenEmbedding, "ACTGGAGGTGAAGCGA");
+                RunSimplePrediction(predictor, tokenEmbedding, "TATCGATACGTAGGAG");
+                RunSimplePrediction(predictor, tokenEmbedding, "GCCTTCGTAGGCTGTT");
+
+
             }
         }
     }
     public static void RunSimplePrediction(FractalOpponent predictor, Embedding tokenEmbedding, string testSeq)
+{
+    var device = torch.CPU;
+    predictor.eval();
+
+    long[] tokens = GenomicEngine.Tokenize(testSeq);
+    var h = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
+    var c = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
+
+    Console.WriteLine($"\n--- Fractal Detailed Analysis: {testSeq.ToUpper()} ---");
+    Console.WriteLine("------------------------------------------------------------------------------------------------------");
+    // Columns: Base, ID, Pred, A(%), C(%), G(%), T(%), Sensitivity
+    Console.WriteLine($"{"Base",-4} | {"ID",-2} | {"Pred",-4} | {"A (%)",-6} | {"C (%)",-6} | {"G (%)",-6} | {"T (%)",-6} | {"Sens",-8}");
+    Console.WriteLine("------------------------------------------------------------------------------------------------------");
+
+    using (var noGrad = torch.no_grad())
     {
-        var device = torch.CPU;
-        predictor.eval();
-
-        long[] tokens = GenomicEngine.Tokenize(testSeq);
-        var h = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
-        var c = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
-
-        Console.WriteLine("\n--- Predictive Logic Analysis ---");
-        Console.WriteLine($"Sequenz: {testSeq.ToUpper()}");
-        Console.WriteLine("---------------------------------------------------------");
-        Console.WriteLine($"{"Base",-5} | {"ID",-3} | {"Hidden Norm",-12} | {"Sensitivity",-12}");
-        Console.WriteLine("---------------------------------------------------------");
-
-        using (var noGrad = torch.no_grad())
+        for (int i = 0; i < tokens.Length; i++)
         {
-            for (int i = 0; i < tokens.Length; i++)
+            var inputToken = torch.tensor(new long[] { tokens[i] }).to(device);
+            var (hState, hNext, cNext) = predictor.forward(tokenEmbedding.forward(inputToken), h, c);
+
+            using (var logits = predictor.outputHead.forward(hState))
             {
-                char baseChar = testSeq[i];
-                long tokenId = tokens[i];
+                var probs = torch.nn.functional.softmax(logits, dim: 1);
+                int predIndex = (int)probs.argmax(1).item<long>(); // ArgMax on probabilities
+                char predChar = GenomicEngine.Detokenize(predIndex);
+                char actualChar = testSeq[i];
 
-                var idx = torch.tensor(new long[] { tokenId }).to(device);
-                var emb = tokenEmbedding.forward(idx);          // Embedding.forward verfügbar durch Embedding-Typ
-                var (outPred, hNext, cNext) = predictor.forward(emb, h, c);
+                // PRINTING LOGIC
+                SetConsoleColorByBase(actualChar);
+                Console.Write($"{actualChar,-4}");
+                Console.ResetColor();
+                Console.Write($" | {tokens[i],-2} | ");
 
-                float hNorm = hNext.norm().item<float>();
-                float sensitivity = (hNext - h).norm().item<float>();
+                // Color green if ArgMax actually matches the input
+                if (predChar == actualChar) Console.ForegroundColor = ConsoleColor.Green;
+                else SetConsoleColorByBase(predChar);
 
-                Console.WriteLine($"{baseChar,-5} | {tokenId,-3} | {hNorm,-12:F4} | {sensitivity,-12:E4}");
-                h = hNext;
-                c = cNext;
+                Console.Write($"{predChar,-4}");
+                Console.ResetColor();
+                Console.Write(" | ");
+
+                // Ensure headers match these indices: 0=A, 1=C, 2=G, 3=T
+                float pA = probs[0, 0].item<float>() * 100f;
+                float pC = probs[0, 1].item<float>() * 100f;
+                float pG = probs[0, 2].item<float>() * 100f;
+                float pT = probs[0, 3].item<float>() * 100f;
+
+                // Sensitivity proxy: change in hidden state magnitude
+                float sensitivity = 0f;
+                try { sensitivity = (hNext - h).norm().item<float>(); } catch { }
+
+                Console.WriteLine($"{pA,6:F1} | {pC,6:F1} | {pG,6:F1} | {pT,6:F1} | {sensitivity,8:E4}");
             }
+            h = hNext; c = cNext;
         }
-        Console.WriteLine("---------------------------------------------------------");
     }
+    Console.WriteLine("------------------------------------------------------------------------------------------------------");
+}
+
+// Hilfsmethode für Genetik-Farbstandards
+private static void SetConsoleColorByBase(char c)
+{
+    switch (char.ToUpper(c))
+    {
+        case 'A': Console.ForegroundColor = ConsoleColor.Red; break;    // Adenin: Oft Rot
+        case 'C': Console.ForegroundColor = ConsoleColor.Blue; break;   // Cytosin: Blau
+        case 'G': Console.ForegroundColor = ConsoleColor.Yellow; break; // Guanin: Gelb
+        case 'T': Console.ForegroundColor = ConsoleColor.Cyan; break;   // Thymin: Cyan/Grün
+        default: Console.ForegroundColor = ConsoleColor.Gray; break;    // N: Grau
+    }
+}
     public static void RunMutationStressTest(
     FractalOpponent predictor,
     Embedding tokenEmbedding,

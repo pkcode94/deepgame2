@@ -104,161 +104,97 @@ public class UnifiedMultiHeadTransformerLSTMCell : nn.Module
     {
         return forward_step(x, h, c, externalK: null, externalV: null);
     }
-
+    public bool IsInSensitivityCheck { get; set; } = false;
     // Router- and CT-gate-aware forward step.
     // x: [B,inputSize] or [inputSize] or [1,inputSize]
     // h,c: [B,HiddenSize]
     // externalK/externalV: [S_ext,B,HiddenSize] or null
-    public (Tensor output, Tensor h, Tensor c) forward_step(
-        Tensor x,
-        Tensor h,
-        Tensor c,
-        Tensor? externalK,
-        Tensor? externalV)
+    public (Tensor output, Tensor hNext, Tensor cNext) forward_step(
+    Tensor x, Tensor h, Tensor c, Tensor? externalK, Tensor? externalV)
     {
+        Tensor xIn = x.dim() == 1 ? x.unsqueeze(0) : x;
 
-        // Ensure batch dimension for x_t
-        Tensor xIn = x;
-        if (xIn.dim() == 1)
-            xIn = xIn.unsqueeze(0); // [1,inputSize]
+        // 1) LSTM Update
+        var (hLstm, cNext) = lstm.forward(xIn, (h, c));
+        var cur = hLstm.unsqueeze(0); // [1, 1, HiddenSize]
 
-        // 1) LSTM update in input space -> h_lstm
-        var (hLstm, cNext) = lstm.forward(xIn, (h, c)); // hLstm: [B,H]
-
-        // Write hLstm into rolling self-attention memory
-        var cur = hLstm.unsqueeze(0); // [1,B,H]
-
-        if (memK is null || memV is null)
+        // 2) Rolling Memory Update (mit Initialisierungs-Schutz)
+        if (!IsInSensitivityCheck)
         {
-            memK = cur.detach();
-            memV = cur.detach();
-        }
-        else
-        {
-            var newK = torch.cat(new[] { memK, cur.detach() }, 0); // [S_old+1,B,H]
-            var newV = torch.cat(new[] { memV, cur.detach() }, 0);
-
-            if (newK.shape[0] > memLen)
+            if (memK is null || memV is null)
             {
-                var start = newK.shape[0] - memLen;
-                memK.Dispose();
-                memV.Dispose();
-                memK = newK.slice(0, start, newK.shape[0], 1);
-                memV = newV.slice(0, start, newV.shape[0], 1);
+                // Initialisierung: Der Speicher startet mit dem aktuellen Zustand
+                memK = cur.clone();
+                memV = cur.clone();
             }
             else
             {
-                memK.Dispose();
-                memV.Dispose();
-                memK = newK;
-                memV = newV;
+                // Sicherstellen, dass die Dimensionen für 'cat' passen
+                var nextK = torch.cat(new[] { memK, cur }, 0);
+                var nextV = torch.cat(new[] { memV, cur }, 0);
+
+                if (nextK.shape[0] > memLen)
+                {
+                    var start = nextK.shape[0] - memLen;
+                    memK = nextK.slice(0, start, nextK.shape[0], 1).clone();
+                    memV = nextV.slice(0, start, nextV.shape[0], 1).clone();
+                }
+                else
+                {
+                    memK = nextK;
+                    memV = nextV;
+                }
             }
         }
 
-        // 2) SELF-ATTENTION over rolling memory
-        Tensor selfOut;
-        {
-            // memK/memV: [S,B,H]
-            var qSelf = hLstm.unsqueeze(0); // [1,B,H]
-            var selfRes = selfAttn.forward(qSelf, memK!, memV!, null, false, null);
-            selfOut = selfRes.Item1.squeeze(0); // [B,H]
-        }
+        // SICHERHEITS-CHECK: Falls memK immer noch null ist (sollte nicht passieren)
+        // Erzeuge einen Zero-Tensor, damit Attention nicht abstürzt
+        var effectiveK = memK ?? torch.zeros(new long[] { 1, 1, HiddenSize }).to(x.device);
+        var effectiveV = memV ?? torch.zeros(new long[] { 1, 1, HiddenSize }).to(x.device);
 
-        // 3) OPTIONAL EXTERNAL ATTENTION
+        // 3) Self-Attention & External Attention
+        var qSelf = hLstm.unsqueeze(0);
+
+        // Nutze effectiveK/V statt memK!
+        var (selfAttnOut, _) = selfAttn.forward(qSelf, effectiveK, effectiveV, null, false, null);
+        var selfOut = selfAttnOut.squeeze(0);
+
         Tensor externalOut;
-        bool hasExternal = (externalK is not null) && (externalV is not null);
-
-        if (hasExternal)
+        if (externalK is not null && externalV is not null)
         {
-            var qCross = hLstm.unsqueeze(0); // [1,B,H]
-            var crossRes = crossAttn.forward(qCross, externalK!, externalV!, null, false, null);
-            externalOut = crossRes.Item1.squeeze(0); // [B,H]
+            var (extRes, _) = crossAttn.forward(qSelf, externalK, externalV, null, false, null);
+            externalOut = extRes.squeeze(0);
         }
         else
         {
-            // Use crossAttn over the internal memory as fallback so crossAttn parameters
-            // are part of the graph and receive gradients (prevents zero-grad diagnostics).
-            // This mirrors self-attention but goes through the separate crossAttn module.
-            var qCross = hLstm.unsqueeze(0); // [1,B,H]
-            var crossRes = crossAttn.forward(qCross, memK!, memV!, null, false, null);
-            externalOut = crossRes.Item1.squeeze(0); // [B,H]
+            var (extRes, _) = crossAttn.forward(qSelf, effectiveK, effectiveV, null, false, null);
+            externalOut = extRes.squeeze(0);
         }
 
-        // 4) ROUTER over self vs external
-        var routerLogits = routerMLP.forward(hLstm);   // [B,2]
-        var routerWeights = routerLogits.softmax(1);   // [B,2]
+        // 4) Router & Residual
+        var routerWeights = routerMLP.forward(hLstm).softmax(1);
+        var wSelf = routerWeights.index(TensorIndex.Colon, TensorIndex.Single(0)).unsqueeze(1);
+        var wExt = routerWeights.index(TensorIndex.Colon, TensorIndex.Single(1)).unsqueeze(1);
+        var routedAttn = (wSelf * selfOut) + (wExt * externalOut);
+        var routed = hLstm + routedAttn + residualProject.forward(routedAttn);
 
-        var wSelf = routerWeights.index(new TensorIndex[] {
-            TensorIndex.Colon,
-            TensorIndex.Single(0)
-        }).unsqueeze(1); // [B,1]
+        // 5) CT-GATE
+        // Nutze auch hier effectiveK für den Mittelwert
+        var temporalSummary = effectiveK.mean(new long[] { 0L });
+        var compressed = W_ct_compress.forward(temporalSummary);
+        var expanded = W_ct_expand.forward(compressed);
+        int reps = (HiddenSize + (int)compressed.shape[1] - 1) / (int)compressed.shape[1];
+        var compressedExpanded = compressed.repeat(1, reps).narrow(1, 0, HiddenSize);
+        var g = torch.sigmoid(W_ct_gate.forward(torch.cat(new[] { xIn, routed }, 1)));
+        var hCT = torch.lerp(compressedExpanded, expanded, g);
 
-        var wExt = routerWeights.index(new TensorIndex[] {
-            TensorIndex.Colon,
-            TensorIndex.Single(1)
-        }).unsqueeze(1); // [B,1]
+        // 6) Final Blend
+        var hFinal = torch.stack(new[] { hLstm, routed, hCT }, 0).mean(new long[] { 0 });
+        hFinal = torch.nn.functional.layer_norm(hFinal, new long[] { (long)HiddenSize });
+        hFinal = hFinal.clamp(-3.0, 3.0);
 
-        // For debugging, keep this if you want to see routing behavior:
-        // Console.WriteLine($"router: self={wSelf.mean().ToSingle():F3} ext={wExt.mean().ToSingle():F3}");
-
-        var routedAttn = wSelf * selfOut + wExt * externalOut; // [B,H]
-
-        // residual projection on routed attention
-        var routed = hLstm + routedAttn + residualProject.forward(routedAttn); // [B,H]
-
-        // 5) CT-GATE (temporal transform gate)
-
-        // Temporal summary: mean over time dimension of memK [S,B,H] -> [B,H]
-        Tensor temporalSummary;
-        if (memK is null || memK.shape[0] == 0)
-        {
-            temporalSummary = torch.zeros_like(hLstm);
-        }
-        else
-        {
-            temporalSummary= memK.mean(new long[] { 0L });
-        }
-
-        // Compress summary to bottleneck and expand back
-        var compressedSmall = W_ct_compress.forward(temporalSummary); // [B,bottleneck]
-        var expanded = W_ct_expand.forward(compressedSmall);          // [B,H]
-
-        // Expand compressedSmall to hidden size for blending
-        int csDim = (int)compressedSmall.shape[1];
-        int reps = (HiddenSize + csDim - 1) / csDim;
-
-        var compressedSmallExpanded =
-            compressedSmall
-                .repeat(new long[] { 1L, (long)reps })   // repeat needs long[]
-                .narrow(1L, 0L, (long)HiddenSize);       // narrow needs long args
-
-        // Gate uses original x_t and routed attention representation
-        var gateInput = torch.cat(new Tensor[] { xIn, routed }, 1); // [B, input+H]
-        var g = torch.sigmoid(W_ct_gate.forward(gateInput));        // [B,H]
-
-        var hCT = torch.lerp(compressedSmallExpanded, expanded, g); // [B,H]
-
-        // 6) Final blend (ensemble of LSTM, route
-        // [B,H]
-
-        // In UnifiedMultiHeadTransformerLSTMCell.forward
-        // Ersetzen Sie den finalen Blend-Abschnitt:
-
-        var ensemble = new List<Tensor> { hLstm, routed, hCT };
-        using var stacked = torch.stack(ensemble, 0);
-        var hFinal = stacked.mean(new long[] { 0 });
-
-        // NEU: LayerNorm vor dem Dropout stabilisiert die Skalierung für den Bias
-        hFinal = torch.nn.functional.layer_norm(hFinal, new long[] { HiddenSize });
-
-        hFinal = nn.functional.dropout(hFinal, 0.2, this.training);
-
-        // Korrektur der Rückgabewerte:
-        // hLstm ist der neue Hidden-State (h), cNext ist der neue Cell-State (c)
-        return (hFinal, hLstm, cNext);
-
+        return (hFinal, hFinal, cNext);
     }
-
     public void ResetMemory()
     {
         memK?.Dispose();

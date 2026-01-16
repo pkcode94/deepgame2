@@ -869,7 +869,7 @@ public class Program
 
                 // Zeige die ersten 5 exakten Dimensionen des 64D Vektors
                 Console.WriteLine("[DATA] Exact Vector Matching (First 5 dims):");
-                for (int i = 0; i < 5; i++)
+                for (int i = 0; i < 4; i++)
                 {
                     Console.WriteLine($"  Dim {i}: Exp: {finalExpectedVec[i]:F6} | Got: {finalGottenVec[i]:F6} | Δ: {Math.Abs(finalExpectedVec[i] - finalGottenVec[i]):F6}");
                 }
@@ -897,13 +897,13 @@ public class Program
         // 1. Hyperparameter definieren
         int hiddenSize = 16; // Größe des Gedächtnisses
         int embeddingDim = 16; // Komplexität der Basen-Darstellung
-        int numTokens = 5;    // N, A, C, G, T
+        int numTokens = 4;    // N, A, C, G, T
 
         Console.WriteLine("--- Initialisiere Genom-KI ---");
 
         // 2. Predictor und Embedding initialisieren
         // FractalOpponent ist deine spezifische Gate-Architektur
-        var predictor = new FractalOpponent(new UnifiedMultiHeadTransformerLSTMCell(inputSize: embeddingDim,16,4,10), hiddenSize: hiddenSize,3);
+        var predictor = new FractalOpponent(new UnifiedMultiHeadTransformerLSTMCell(inputSize: embeddingDim,16,4,4), hiddenSize: hiddenSize,4);
 
         // Embedding mappt Token-IDs (1-4) auf Vektoren der Größe 64
         var tokenEmbedding = torch.nn.Embedding(numTokens, embeddingDim);
@@ -1561,7 +1561,7 @@ public class Program
 
             var parts = line.Split(',');
             // Spalte 5 enthält bei EHT-Daten oft die Flux-Intensität (I)
-            if (parts.Length > 5 && double.TryParse(parts[5], System.Globalization.CultureInfo.InvariantCulture, out double val))
+            if (parts.Length > 4 && double.TryParse(parts[4], System.Globalization.CultureInfo.InvariantCulture, out double val))
             {
                 numericData.Add(val);
             }

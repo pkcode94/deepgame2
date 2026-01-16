@@ -738,16 +738,13 @@ public class Program
         }
     }
     public static void TrainFractalSupervisedFixedInput(
-        FractalOpponent generator,
-        FractalOpponent predictor,
-        Embedding tokenEmbedding,
-        int seqLen = 6)
+       FractalOpponent generator,
+       FractalOpponent predictor,
+       Embedding tokenEmbedding,
+       int seqLen = 6)
     {
         var device = torch.CPU;
-
-        // Freeze generator params (teacher)
-        foreach (var p in generator.parameters())
-            p.requires_grad = false;
+        foreach (var p in generator.parameters()) p.requires_grad = false;
 
         var opt = torch.optim.Adam(
             predictor.parameters().Concat(tokenEmbedding.parameters()),
@@ -755,7 +752,7 @@ public class Program
         );
 
         var inputTokens = Enumerable.Repeat(1, seqLen).ToArray();
-        float lambda = 1e-4f;
+        float lambda = 0.01f;
         float entropyCoef = 0.05f;
 
         for (int epoch = 0; epoch < 2000; epoch++)
@@ -764,41 +761,66 @@ public class Program
 
             var hGen = torch.zeros(new long[] { 1, generator.hiddenSize }).to(device);
             var cGen = torch.zeros(new long[] { 1, generator.hiddenSize }).to(device);
-
             var hPred = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
             var cPred = torch.zeros(new long[] { 1, predictor.hiddenSize }).to(device);
 
             Tensor totalLoss = torch.tensor(0f).to(device);
-            float seriesMseAccumulator = 0f; // Für den reinen Vorhersage-Loss
 
-            // Speicher für die finale Ausgabe (für Debug-Print)
-            float lastExpected = 0f;
-            float lastGotten = 0f;
-            float avgSeriesLoss =0f;
+            // Speicher für exakte Werte (Letzter Zeitschritt)
+            float[]? finalExpectedVec = null;
+            float[]? finalGottenVec = null;
+
             for (int t = 0; t < seqLen; t++)
             {
                 var idx = torch.tensor(new long[] { inputTokens[t] }).to(device);
                 var emb = tokenEmbedding.forward(idx);
 
-                // 1. Teacher Step
                 var (outGen, hGenNext, cGenNext) = generator.forward(emb, hGen, cGen);
-
-                // 2. Student Step
                 var (outPred, hPredNext, cPredNext) = predictor.forward(emb, hPred, cPred);
 
-                // 3. Output Matching (Series Loss)
-                var stepMse = torch.nn.functional.mse_loss(outPred, outGen.detach());
-                totalLoss += stepMse;
-                seriesMseAccumulator += stepMse.item<float>();
-
-                // Werte für den Print am Ende der Sequenz merken
-                if (t == seqLen - 1)
+                // --- SCALED MSE LOGIK ---
+                // Wir berechnen die Range (Max - Min) des Teacher-Signals zur Normalisierung
+                // Das verhindert, dass kleine Fluktuationen bei großen Werten ignoriert werden.
+                using (var teacher = outGen.detach())
                 {
-                    lastExpected = outGen.mean().item<float>(); // Mittelwert als Repräsentant
-                    lastGotten = outPred.mean().item<float>();
+                    var diff = outPred - teacher;
+
+                    // 1. Huber Loss statt MSE: 
+                    // Wirkt wie MSE bei kleinen Fehlern, aber wie MAE bei großen (keine Explosion).
+                    var huber = torch.nn.functional.huber_loss(outPred, teacher, reduction: nn.Reduction.Mean, delta: 0.1f);
+
+                    // 2. Log-Variance Dämpfung (Optional):
+                    // Anstatt hart zu dividieren, nutzen wir den Logarithmus der Streuung,
+                    // um den Loss nur sanft zu verstärken, wenn das Signal komplex ist.
+                    var logStd = (teacher.std() + 1e-6f).log().clamp(-2.0f, 2.0f);
+                    var scaleFactor = (1.0f - logStd).clamp(0.5f, 2.0f);
+
+                    // Finaler Loss
+                    totalLoss += huber * scaleFactor;
+
+                    if (t == seqLen - 1)
+                    {
+                        // Exakte Vektoren für den Debug-Print kopieren
+                        finalExpectedVec = teacher.view(-1).data<float>().ToArray();
+                        finalGottenVec = outPred.detach().view(-1).data<float>().ToArray();
+
+
+                        string fileName = $"C:\\xampp\\htdocs\\deepseekx\\bin\\Debug\\net8.0\\win-x64\\vector_match.csv";
+                        using (var writer = new StreamWriter(fileName,true))
+                        {
+                            writer.WriteLine("Dimension,Expected,Gotten");
+                            for (int i = 0; i < finalExpectedVec.Length; i++)
+                            {
+                                writer.WriteLine($"{i},{finalExpectedVec[i].ToString(System.Globalization.CultureInfo.InvariantCulture)},{finalGottenVec[i].ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                            }
+                        }
+                        Console.WriteLine($"[PLOT] Vektor-Snapshot gespeichert: {fileName}");
+                        // --- DEBUG OUTPUT (Präzise Darstellung) ---
+
+                    }
                 }
 
-                // --- ROUTER ENTROPY ---
+                // Router Entropy (bleibt gleich)
                 var depthLogits = predictor.lastdepthlogits;
                 if (depthLogits is not null)
                 {
@@ -808,37 +830,50 @@ public class Program
                     totalLoss -= entropyCoef * entropy;
                 }
 
-                hGen = hGenNext;
-                cGen = cGenNext;
-                hPred = hPredNext;
-                cPred = cPredNext;
-
-                avgSeriesLoss = seriesMseAccumulator / seqLen;
-
+                hGen = hGenNext; cGen = cGenNext;
+                hPred = hPredNext; cPred = cPredNext;
             }
+            float progress = (float)epoch / 2000;
+            // Simulated Annealing für den Entropy-Koeffizienten (sinkt über Zeit)
+            float currentEntropyCoef = 0.05f * (1.0f - progress);
 
-            // 4. Weight Matching Loss
-            var wLoss = WeightMatchingLoss(generator, predictor, lambda);
-            totalLoss += wLoss;
-
-            // 5. Backward Pass
+            // Optional: Annealing für die Gewichtung des WeightMatchingLoss
+            float currentLambda = 0.1f + (progress * 0.4f); // Wird strenger gegen Ende
+            totalLoss += WeightMatchingLoss(generator, predictor, currentLambda);
             totalLoss.backward();
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm: 1.0);
+
+            // --- GRADIENT FLOW DEBUG ---
+            Console.WriteLine($"--- Gradient Flow (Epoch {epoch}) ---");
+                foreach (var (name, param) in predictor.named_parameters())
+                {
+                    if (param.grad is not null)
+                    {
+                        var gradNorm = param.grad.norm().item<float>();
+                        var paramNorm = param.norm().item<float>();
+                        // Das Verhältnis zeigt, wie stark die Änderung relativ zur Größe ist
+                        Console.WriteLine($"{name,-30} | Grad Norm: {gradNorm:E4} | Ratio: {(gradNorm / paramNorm):E4}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{name,-30} | NO GRADIENT");
+                    }
+                }
+
+
+            torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm: 0.1);
             opt.step();
 
-            // --- DEBUG OUTPUT ---
+            
             Console.WriteLine($"\nEpoch {epoch} -----------------------------------");
-            Console.WriteLine($"[LOSS] Total: {totalLoss.item<float>():F6} | Series MSE: {avgSeriesLoss:F8}");
+                Console.WriteLine($"[LOSS] Total: {totalLoss.item<float>():F6}");
 
-            // Print Input, Expected, Gotten
-            // Da Input hier fix ist (Token 1), printen wir die skalaren Repräsentationen
-            Console.WriteLine($"[DATA] Input Token: {inputTokens[0]} (Sequence Len: {seqLen})");
-            Console.WriteLine($"[PRED] Expected (Teacher Avg): {lastExpected:F6}");
-            Console.WriteLine($"[PRED] Gotten   (Student Avg): {lastGotten:F6}");
-            Console.WriteLine($"[DIFF] Delta: {Math.Abs(lastExpected - lastGotten):F6}");
-
-            CompareWeights(generator, predictor);
-
+                // Zeige die ersten 5 exakten Dimensionen des 64D Vektors
+                Console.WriteLine("[DATA] Exact Vector Matching (First 5 dims):");
+                for (int i = 0; i < 5; i++)
+                {
+                    Console.WriteLine($"  Dim {i}: Exp: {finalExpectedVec[i]:F6} | Got: {finalGottenVec[i]:F6} | Δ: {Math.Abs(finalExpectedVec[i] - finalGottenVec[i]):F6}");
+                }
+            
         }
     }
     public static int[] GenerateComplexSineTokens(int count, int vocabSize)
@@ -858,6 +893,45 @@ public class Program
     }
     public static void Main(string[] args)
     {
+        string dna = GenomicEngine.LoadAndCleanSequence("C:\\xampp\\htdocs\\deepseekx\\genome.txt");
+        // 1. Hyperparameter definieren
+        int hiddenSize = 16; // Größe des Gedächtnisses
+        int embeddingDim = 16; // Komplexität der Basen-Darstellung
+        int numTokens = 5;    // N, A, C, G, T
+
+        Console.WriteLine("--- Initialisiere Genom-KI ---");
+
+        // 2. Predictor und Embedding initialisieren
+        // FractalOpponent ist deine spezifische Gate-Architektur
+        var predictor = new FractalOpponent(new UnifiedMultiHeadTransformerLSTMCell(inputSize: embeddingDim,16,4,10), hiddenSize: hiddenSize,3);
+
+        // Embedding mappt Token-IDs (1-4) auf Vektoren der Größe 64
+        var tokenEmbedding = torch.nn.Embedding(numTokens, embeddingDim);
+
+        // 3. Daten laden
+
+
+        string dnaSequence = dna;
+
+        // 4. Training starten
+        // Wir übergeben die Instanzen an die Trainings-Funktion
+        Console.WriteLine("Starte Training auf der geladenen Sequenz...");
+
+        try
+        {
+            // Wir nutzen hier die stabilisierte Funktion mit dem Optimizer-Patch
+            GenomicEngine.TrainOnGenomics(predictor, tokenEmbedding, dnaSequence, epochs: 100, windowSize: 16);
+            
+            Console.WriteLine("\n--- Training abgeschlossen ---");
+
+            // 5. Ein kurzes Test-Szenario: Was sagt das Modell über die ersten 10 Basen?
+
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ein Fehler ist aufgetreten: {ex.Message}");
+        }
+        return;
         int H = 32;
         int vocabSize = 100;
         int maxDepth = 3;
@@ -867,7 +941,7 @@ public class Program
         var generator = new FractalOpponent(genCell, H, maxDepth).to(device);
 
         var predCell = new UnifiedMultiHeadTransformerLSTMCell(H, H, 4).to(device);
-        var predictor = new FractalOpponent(predCell, H, maxDepth).to(device);
+        //var predictor = new FractalOpponent(predCell, H, maxDepth).to(device);
 
         // FIX 3: Eindeutiger Name, um Konflikte zu vermeiden
         var sharedEmbedding = nn.Embedding(vocabSize, H).to(device);

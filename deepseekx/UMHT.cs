@@ -83,7 +83,19 @@ public class UnifiedMultiHeadTransformerLSTMCell : nn.Module
             nn.Dropout(0.1), // 10% Dropout für die finale Entscheidung
             nn.Linear(hiddenSize, outputSize) // Hier 'outputSize' statt 'vocabSize'
         );
-
+        // Initialisierung für stabilen Gradientenfluss
+        // Sicherer Zugriff auf die internen Parameter von MultiheadAttention
+        foreach (var (name, param) in crossAttn.named_parameters())
+        {
+            if (name.Contains("in_proj_weight"))
+            {
+                nn.init.xavier_uniform_(param);
+            }
+            if (name.Contains("in_proj_bias"))
+            {
+                nn.init.zeros_(param);
+            }
+        }
         RegisterComponents();
     }
 
@@ -164,7 +176,12 @@ public class UnifiedMultiHeadTransformerLSTMCell : nn.Module
         }
         else
         {
-            externalOut = torch.zeros_like(hLstm);
+            // Use crossAttn over the internal memory as fallback so crossAttn parameters
+            // are part of the graph and receive gradients (prevents zero-grad diagnostics).
+            // This mirrors self-attention but goes through the separate crossAttn module.
+            var qCross = hLstm.unsqueeze(0); // [1,B,H]
+            var crossRes = crossAttn.forward(qCross, memK!, memV!, null, false, null);
+            externalOut = crossRes.Item1.squeeze(0); // [B,H]
         }
 
         // 4) ROUTER over self vs external

@@ -858,8 +858,6 @@ public class Program
     }
     public static void Main(string[] args)
     {
-        RunMandelbrotTrajectoryTest(new FractalOpponent(64, 3));
-        return;
         int H = 32;
         int vocabSize = 100;
         int maxDepth = 3;
@@ -874,7 +872,7 @@ public class Program
         // FIX 3: Eindeutiger Name, um Konflikte zu vermeiden
         var sharedEmbedding = nn.Embedding(vocabSize, H).to(device);
 
-        int[] tokens = GenerateComplexSineTokens(1000, vocabSize);
+        //int[] tokens = GenerateComplexSineTokens(1000, vocabSize);
 
          TrainFractalSupervisedFixedInput(generator,predictor, sharedEmbedding, 100);
 
